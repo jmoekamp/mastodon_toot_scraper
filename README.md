@@ -2,6 +2,9 @@
 
 A static-site generator plugin that fetches Mastodon threads and renders them as self-contained HTML fragments for embedding in blog posts. It scans `.markdown` files for frontmatter fields, fetches the corresponding Mastodon thread via the public API, and writes `.html.include` files ready for server-side inclusion.
 
+## AI
+This tool and documentation is 100% AI. So i don't have any copyright on it. Do want you want with the code. I would assume the strictest open source license in case the AI took code from somewhere else.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
