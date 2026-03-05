@@ -31,6 +31,7 @@ import hashlib
 import json
 import sys
 import os
+import signal
 import tempfile
 import time
 import html as H
@@ -57,14 +58,17 @@ except ImportError:
 
 DEFAULT_TOOT_CACHE  = "/var/tmp/gencache/mastodontootcache"
 DEFAULT_AVATAR_DIR  = "/var/tmp/gencache/mastodonavatarcache"
-DEFAULT_AVATAR_URL  = "https://www.webserver.example.com/images/mastodonavatarcache"
+DEFAULT_AVATAR_URL  = "https://www.blog.example.com/images/mastodonavatarcache"
 DEFAULT_MEDIA_DIR   = "/var/tmp/gencache/mastodonmediacache"
-DEFAULT_MEDIA_URL   = "https://www.webserver.example.com/images/mastodonmediacache"
+DEFAULT_MEDIA_URL   = "https://www.blog.example.com/images/mastodonmediacache"
 DEFAULT_MAX_AGE_H   = 3        # hours – toot cache TTL
 DEFAULT_AV_AGE_D    = 30       # days  – avatar cache TTL
 DEFAULT_MEDIA_AGE_D = 30       # days  – media cache TTL
 DEFAULT_RATE_LIMIT  = 5.0      # seconds between API calls
 DEFAULT_MAX_DEPTH   = 5        # max nesting depth
+DEFAULT_HIGHLIGHT   = 10       # min favourites to highlight a toot
+DEFAULT_FOLD_DEPTH  = 3        # fold subtrees at this depth
+DEFAULT_FOLD_THRESH = 50       # only fold if total comments exceed this
 DEFAULT_SINCE_WEEKS = 4        # only process posts from last N weeks
 DEFAULT_RETRIES     = 3        # API retry attempts
 DEFAULT_STALE_AFTER = "12m"    # skip threads with no reply for 12 months
@@ -106,6 +110,10 @@ DEFAULT_LABELS = {
     "voters_1":             "{n} voter",
     "votes":                "{n} votes",
     "votes_1":              "{n} vote",
+
+    # Fold
+    "fold_replies":         "{n} more replies",
+    "fold_replies_1":       "{n} more reply",
 
     # ARIA labels
     "post_by_aria":         "Post by {handle}",
@@ -246,6 +254,9 @@ _CONFIG_KEYS = {
     "max_depth":      ("max_depth",      int),
     "retries":        ("retries",        int),
     "max_toots":      ("max_toots",      int),
+    "highlight_above":("highlight_above", int),
+    "fold_depth":     ("fold_depth",      int),
+    "fold_threshold": ("fold_threshold",  int),
     "sort":           ("sort",           str),
     "since":          ("since",          int),
 }
@@ -280,10 +291,10 @@ def load_config(path):
         toot_cache_dir = /var/tmp/gencache/mastodontootcache
         max_age = 3
         avatar_dir = /var/tmp/gencache/mastodonavatarcache
-        avatar_url = https://www.webserver.example.com/images/mastodonavatarcache
+        avatar_url = https://www.blog.example.com/images/mastodonavatarcache
         avatar_max_age = 30
         media_dir = /var/tmp/gencache/mastodonmediacache
-        media_url = https://www.webserver.example.com/images/mastodonmediacache
+        media_url = https://www.blog.example.com/images/mastodonmediacache
         media_max_age = 30
         stale_after = 12m
         max_age_stale = 7
@@ -409,6 +420,73 @@ def is_filtered(toot, blocklist, whitelist):
 
 
 # =========================================================================
+# Cache directory registry (cross-cache collision detection)
+# =========================================================================
+
+# Maps os.path.abspath(dir) → label.  Populated by register_cache_dirs().
+_cache_registry = {}
+
+
+def register_cache_dirs(**dirs):
+    """
+    Register cache directories and warn about overlaps.
+    Call once from main() with label=path pairs, e.g.
+      register_cache_dirs(avatar="/a", media="/m", toot="/t")
+    """
+    global _cache_registry
+    global _hash_seen
+    _cache_registry = {}
+    _hash_seen = {}
+    seen = {}
+    for label, path in dirs.items():
+        absp = os.path.abspath(path)
+        if absp in seen:
+            log_warn("WARN  Cache directory overlap: '{}' and '{}' both use "
+                     "{}".format(seen[absp], label, absp))
+        seen[absp] = label
+        _cache_registry[absp] = label
+
+
+def _check_cross_cache(fname, own_dir):
+    """
+    Check if *fname* already exists in a registered cache directory
+    other than *own_dir*.  Logs a warning if found.
+    """
+    if not _cache_registry:
+        return
+    own_abs = os.path.abspath(own_dir)
+    for reg_dir, reg_label in _cache_registry.items():
+        if reg_dir == own_abs:
+            continue
+        cross_path = os.path.join(reg_dir, fname)
+        if os.path.isfile(cross_path):
+            log_warn("    WARN  {} exists in {} cache ({}), "
+                     "also being written to {}".format(
+                         fname[:20], reg_label, reg_dir, own_abs))
+
+
+# Maps (cache_dir_abs, filename) → first URL seen.  Detects the
+# astronomically unlikely case of two different URLs producing the
+# same SHA-256 hash within a single cache directory.
+_hash_seen = {}
+
+
+def _check_hash_collision(fname, url, cache_dir):
+    """
+    Record that *fname* was produced by *url* in *cache_dir*.
+    Warns if a *different* URL previously produced the same filename.
+    """
+    key = (os.path.abspath(cache_dir), fname)
+    prev = _hash_seen.get(key)
+    if prev is None:
+        _hash_seen[key] = url
+    elif prev != url:
+        log_warn("    WARN  Hash collision in {}: {} maps to both "
+                 "{} and {}".format(
+                     cache_dir, fname[:20] + "...", prev[:60], url[:60]))
+
+
+# =========================================================================
 # Avatar: download, SVG placeholder, resolution
 # =========================================================================
 
@@ -456,6 +534,7 @@ def download_avatar(url, avatar_dir, max_age_s):
     Returns local filename or None on failure.
     """
     fname = avatar_filename(url)
+    _check_hash_collision(fname, url, avatar_dir)
     local_path = os.path.join(avatar_dir, fname)
 
     try:
@@ -474,6 +553,7 @@ def download_avatar(url, avatar_dir, max_age_s):
         })
         with urlopen(req, timeout=15) as resp:
             data = resp.read()
+        _check_cross_cache(fname, avatar_dir)
         with open(local_path, "wb") as fh:
             fh.write(data)
         log_debug("    AVATAR downloaded: {}".format(fname[:16] + "..."))
@@ -519,6 +599,7 @@ def download_media(url, media_dir, max_age_s):
     Returns local filename or None on failure.
     """
     fname = media_filename(url)
+    _check_hash_collision(fname, url, media_dir)
     local_path = os.path.join(media_dir, fname)
 
     try:
@@ -537,6 +618,7 @@ def download_media(url, media_dir, max_age_s):
         })
         with urlopen(req, timeout=30) as resp:
             data = resp.read()
+        _check_cross_cache(fname, media_dir)
         with open(local_path, "wb") as fh:
             fh.write(data)
         log_debug("    MEDIA  downloaded: {}".format(fname[:16] + "..."))
@@ -663,6 +745,17 @@ _RL_LOW_THRESHOLD = 15
 # Module-level state: updated after every successful api_get call.
 _last_ratelimit = {"remaining": None, "reset": None}
 
+# Graceful shutdown: set by SIGTERM/SIGINT handler, checked in main loop.
+_shutdown_requested = False
+
+
+def _shutdown_handler(signum, frame):
+    """Signal handler for SIGTERM/SIGINT: request graceful shutdown."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log_warn("  {}  received, finishing current thread...".format(sig_name))
+
 
 def _parse_ratelimit_headers(http_headers):
     """
@@ -738,7 +831,8 @@ def api_get(url, token=None, retries=3):
         try:
             with urlopen(req, timeout=20) as r:
                 _last_ratelimit = _parse_ratelimit_headers(r.headers)
-                raw = r.read().decode("utf-8")
+                charset = r.headers.get_content_charset("utf-8")
+                raw = r.read().decode(charset)
             try:
                 return json.loads(raw)
             except (json.JSONDecodeError, ValueError):
@@ -859,10 +953,22 @@ def _render_media_html(attachments, media_dir=None, media_base_url=None,
 
         if mtype == "image":
             alt_badge = render_alt_badge(m.get("description", "") or "")
+            # Responsive: srcset with preview (small) and original (full)
+            meta = m.get("meta") or {}
+            pre_w = (meta.get("small") or {}).get("width", 400)
+            full_w = (meta.get("original") or {}).get("width", 1200)
+            if raw_u != raw_pre and full_w > pre_w:
+                srcset = ' srcset="{pre} {pw}w, {full} {fw}w"'.format(
+                    pre=pre, pw=pre_w, full=u, fw=full_w)
+                sizes = ' sizes="(max-width:520px) 100vw, 600px"'
+            else:
+                srcset = ""
+                sizes = ""
             parts.append(
                 '<div class="{0}__media"><a href="{1}" target="_blank">'
-                '<img src="{2}" alt="{3}" loading="lazy"></a>'
-                '{4}</div>'.format(NS, u, pre, alt, alt_badge))
+                '<img src="{2}" alt="{3}" loading="lazy"{4}{5}></a>'
+                '{6}</div>'.format(NS, u, pre, alt, srcset, sizes,
+                                   alt_badge))
         elif mtype == "video":
             parts.append(
                 '<div class="{0}__media"><video controls preload="metadata"'
@@ -895,6 +1001,106 @@ def _wrap_sensitive(media_html, sensitive, labels):
         '</details>'
     ).format(ns=NS, svg=SVG_CW, media=media_html,
              sensitive_label=labels["sensitive_toggle"])
+
+
+def _render_card_html(card, media_dir=None, media_base_url=None,
+                      media_max_age_s=0):
+    """
+    Render a Mastodon link preview card to HTML.
+    Returns empty string if card is None or lacks url/title.
+    Thumbnail image is cached via the media cache.
+    """
+    if not card or not isinstance(card, dict):
+        return ""
+    url = card.get("url", "")
+    title = (card.get("title") or "").strip()
+    if not url or not title:
+        return ""
+
+    esc_url = H.escape(url)
+    esc_title = H.escape(title)
+    desc = (card.get("description") or "").strip()
+    esc_desc = H.escape(desc[:200] + ("..." if len(desc) > 200 else ""))
+    provider = (card.get("provider_name") or "").strip()
+    if not provider:
+        try:
+            provider = urlparse(url).netloc
+        except Exception:
+            provider = ""
+    esc_provider = H.escape(provider)
+
+    # Thumbnail: cache locally via media cache
+    thumb_html = ""
+    image_url = card.get("image") or ""
+    if image_url:
+        cached_src = H.escape(resolve_media_src(
+            image_url, media_dir, media_base_url, media_max_age_s))
+        thumb_html = (
+            '<div class="{ns}__card-thumb">'
+            '<img src="{src}" alt="" loading="lazy"></div>'
+        ).format(ns=NS, src=cached_src)
+
+    return (
+        '<a href="{url}" class="{ns}__card-preview" target="_blank"'
+        ' rel="nofollow noopener">\n'
+        '  {thumb}\n'
+        '  <div class="{ns}__card-text">\n'
+        '    <div class="{ns}__card-provider">{provider}</div>\n'
+        '    <div class="{ns}__card-title">{title}</div>\n'
+        '    <div class="{ns}__card-desc">{desc}</div>\n'
+        '  </div>\n'
+        '</a>'
+    ).format(ns=NS, url=esc_url, thumb=thumb_html,
+             provider=esc_provider, title=esc_title, desc=esc_desc)
+
+
+def _render_quote_html(quote, custom_emojis=False, labels=None):
+    """
+    Render a quoted toot (Mastodon 4.3+ quote posts) as an embedded box.
+    Returns empty string if quote is None or not a dict.
+    """
+    if not quote or not isinstance(quote, dict):
+        return ""
+    if labels is None:
+        labels = DEFAULT_LABELS
+
+    qa = quote.get("account", {})
+    q_name = H.escape(qa.get("display_name") or qa.get("username", "?"))
+    if custom_emojis:
+        q_name = resolve_emojis(q_name, qa.get("emojis", []))
+    q_handle = H.escape("@{}".format(qa.get("acct", "?")))
+    q_avatar = H.escape(qa.get("avatar_static", qa.get("avatar", "")))
+    q_url = H.escape(quote.get("url") or quote.get("uri", "#"))
+    q_ts = fmt_rel(quote.get("created_at", ""))
+    q_ts_abs = fmt_abs(quote.get("created_at", ""))
+    q_ts_iso = fmt_iso(quote.get("created_at", ""))
+
+    q_body = clean(quote.get("content", ""), ugc=True)
+    if custom_emojis:
+        q_body = resolve_emojis(q_body, quote.get("emojis", []))
+
+    # Truncate very long quoted content
+    # (render full body but CSS will clamp to 4 lines)
+    q_lang = quote.get("language") or ""
+    q_lang_attr = ' lang="{}"'.format(H.escape(q_lang)) if q_lang else ""
+
+    return (
+        '<a href="{url}" class="{ns}__quote" target="_blank"'
+        ' rel="nofollow noopener">\n'
+        '  <div class="{ns}__quote-head">\n'
+        '    <img class="{ns}__quote-av" src="{avatar}" alt=""'
+        ' loading="lazy">\n'
+        '    <span class="{ns}__quote-name">{name}</span>\n'
+        '    <span class="{ns}__quote-handle">{handle}</span>\n'
+        '    <span class="{ns}__quote-time">'
+        '<time datetime="{ts_iso}" title="{ts_abs}">{ts}</time></span>\n'
+        '  </div>\n'
+        '  <div class="{ns}__quote-body"{lang}>{body}</div>\n'
+        '</a>'
+    ).format(ns=NS, url=q_url, avatar=q_avatar,
+             name=q_name, handle=q_handle,
+             ts=q_ts, ts_abs=q_ts_abs, ts_iso=q_ts_iso,
+             lang=q_lang_attr, body=q_body)
 
 
 def resolve_emojis(text, emojis):
@@ -1019,6 +1225,14 @@ def _iter_nodes(node):
             yield n
 
 
+def _count_descendants(node):
+    """Count all descendants (children, grandchildren, ...) of *node*."""
+    c = 0
+    for ch in node.children:
+        c += 1 + _count_descendants(ch)
+    return c
+
+
 def sort_tree(node, mode="oldest"):
     """
     Recursively sort children of each node.
@@ -1125,10 +1339,27 @@ def render_article_block(root_data, chain, avatar_dir=None,
             media_max_age_s=media_max_age_s)
         media = _wrap_sensitive(media, t.get("sensitive", False), labels)
 
+        # Link preview card (skip if media attachments present)
+        card = ""
+        if not t.get("media_attachments"):
+            card = _render_card_html(
+                t.get("card"), media_dir=media_dir,
+                media_base_url=media_base_url,
+                media_max_age_s=media_max_age_s)
+
+        # Quoted toot
+        quote = _render_quote_html(
+            t.get("quote"), custom_emojis=custom_emojis, labels=labels)
+
+        lang = t.get("language") or ""
+        lang_attr = ' lang="{}"'.format(H.escape(lang)) if lang else ""
+
         parts.append((
             '<div class="{ns}__article-post" id="toot-{tid}">\n'
-            '  <div class="{ns}__article-body">{content}</div>\n'
+            '  <div class="{ns}__article-body"{lang}>{content}</div>\n'
             '  {media}\n'
+            '  {card}\n'
+            '  {quote}\n'
             '  <div class="{ns}__article-meta">'
             '<a href="{url}" target="_blank" rel="noopener" '
             'class="{ns}__time" title="{ts_abs}">'
@@ -1138,7 +1369,8 @@ def render_article_block(root_data, chain, avatar_dir=None,
             'title="{permalink}" aria-label="{permalink}">{svg_link}</a>'
             '</div>\n'
             '</div>'
-        ).format(ns=NS, tid=toot_id, content=content, media=media,
+        ).format(ns=NS, tid=toot_id, content=content, lang=lang_attr,
+                 media=media, card=card, quote=quote,
                  url=toot_url, ts_abs=ts_abs, ts_rel=ts_rel, ts_iso=ts_iso,
                  edited=edited_tag, svg_link=SVG_LINK,
                  permalink=labels["permalink"]))
@@ -1329,6 +1561,7 @@ class RenderContext:
         "article_ids", "op_acct", "reply_map",
         "media_dir", "media_base_url", "media_max_age_s",
         "labels", "counter", "seen_boost_ids",
+        "highlight_above", "fold_depth",
     )
 
     def __init__(self, blocklist=None, whitelist=None,
@@ -1336,7 +1569,8 @@ class RenderContext:
                  max_depth=5, custom_emojis=False,
                  article_ids=None, op_acct=None, reply_map=None,
                  media_dir=None, media_base_url=None, media_max_age_s=0,
-                 labels=None, counter=None, seen_boost_ids=None):
+                 labels=None, counter=None, seen_boost_ids=None,
+                 highlight_above=0, fold_depth=0):
         self.blocklist = blocklist
         self.whitelist = whitelist
         self.avatar_dir = avatar_dir
@@ -1353,6 +1587,8 @@ class RenderContext:
         self.labels = labels if labels is not None else DEFAULT_LABELS
         self.counter = counter
         self.seen_boost_ids = seen_boost_ids
+        self.highlight_above = highlight_above
+        self.fold_depth = fold_depth
 
 
 def render_toot(node, depth=0, is_root=False, ctx=None):
@@ -1482,6 +1718,20 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
             kids = '<div class="{0}__replies">{1}</div>'.format(
                 NS, "\n".join(parts))
 
+        # Fold deep subtrees into <details> when fold is active
+        if (kids
+                and ctx.fold_depth > 0
+                and depth >= ctx.fold_depth):
+            n_desc = _count_descendants(node)
+            fold_label = _pl(labels, "fold_replies", n_desc).format(n=n_desc)
+            kids = (
+                '<details class="{ns}__fold">\n'
+                '<summary class="{ns}__fold-toggle">'
+                '{label}</summary>\n'
+                '{kids}\n'
+                '</details>'
+            ).format(ns=NS, label=fold_label, kids=kids)
+
     if blocked:
         return render_blocked(visual_depth, labels=labels) + "\n" + kids
 
@@ -1594,6 +1844,10 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
     cls = "{0}__toot {0}__root".format(NS) if is_root else "{0}__toot".format(NS)
     if boost_banner:
         cls += " {0}__toot--boost".format(NS)
+    if (ctx.highlight_above > 0
+            and not is_root
+            and (n_fav or 0) >= ctx.highlight_above):
+        cls += " {0}__toot--popular".format(NS)
 
     # Reply-to indicator (only at depth >= 2, where context isn't obvious)
     reply_to_html = ""
@@ -1623,6 +1877,15 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
                  body=body, show_content=labels["show_content"])
     else:
         body_html = body
+
+    # Wrap in div only if non-empty; suppress empty body blocks
+    if body_html.strip():
+        lang = t.get("language") or ""
+        lang_attr = ' lang="{}"'.format(H.escape(lang)) if lang else ""
+        body_html = '<div class="{ns}__body"{lang}>{b}</div>'.format(
+            ns=NS, lang=lang_attr, b=body_html)
+    else:
+        body_html = ""
 
     # Media (only for OP's toots)
     media = ""
@@ -1693,6 +1956,18 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
         ).format(ns=NS, options=options_html, footer=footer_txt,
                  poll_aria=labels["poll_aria"])
 
+    # Link preview card (OP only, skip if media attachments present)
+    card_html = ""
+    if is_op and not t.get("media_attachments"):
+        card_html = _render_card_html(
+            t.get("card"), media_dir=media_dir,
+            media_base_url=media_base_url,
+            media_max_age_s=media_max_age_s)
+
+    # Quoted toot (Mastodon 4.3+ quote posts)
+    quote_html = _render_quote_html(
+        t.get("quote"), custom_emojis=custom_emojis, labels=labels)
+
     # Indentation style: use padding-left based on visual_depth
     indent_px = visual_depth * 10
     if is_root:
@@ -1721,9 +1996,11 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
         '<time datetime="{ts_iso}">{ts_rel}</time></a>{edited}\n'
         '    </div>\n'
         '    {reply_to}\n'
-        '    <div class="{ns}__body">{body_html}</div>\n'
+        '    {body_html}\n'
         '    {media}\n'
         '    {poll}\n'
+        '    {card}\n'
+        '    {quote}\n'
         '    <div class="{ns}__stats" role="group"'
         ' aria-label="{engagement_aria}">\n'
         '      <span class="{ns}__st {ns}__st--reply"'
@@ -1747,7 +2024,7 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
         toot_url=toot_url, ts_abs=ts_abs, ts_rel=ts_rel, ts_iso=ts_iso,
         edited=edited_tag,
         reply_to=reply_to_html, body_html=body_html,
-        media=media, poll=poll_html,
+        media=media, poll=poll_html, card=card_html, quote=quote_html,
         n_reply=n_reply, n_boost=n_boost, n_fav=n_fav,
         svg_reply=SVG_REPLY, svg_boost=SVG_BOOST, svg_star=SVG_STAR,
         kids=kids,
@@ -1787,6 +2064,7 @@ SCOPED_CSS = """<style>
 .{ns}__card{{background:var(--mt-card);border:1px solid var(--mt-border);border-radius:var(--mt-r);padding:.85rem 1rem;margin-bottom:.5rem;transition:border-color .2s,box-shadow .2s}}
 .{ns}__card:hover{{border-color:var(--mt-accent);box-shadow:0 2px 16px var(--mt-shadow)}}
 .{ns}__root>.{ns}__card{{background:var(--mt-card2);border-color:var(--mt-accent)}}
+.{ns}__toot--popular>.{ns}__card{{border-color:var(--mt-fav);box-shadow:inset 3px 0 0 var(--mt-popular)}}
 .{ns}__head{{display:flex;align-items:center;gap:.6rem;margin-bottom:.55rem}}
 .{ns}__av{{width:var(--mt-av);height:var(--mt-av);border-radius:9px;object-fit:cover;border:2px solid var(--mt-border);transition:border-color .2s;flex-shrink:0}}
 .{ns}__card:hover .{ns}__av{{border-color:var(--mt-accent)}}
@@ -1803,7 +2081,8 @@ SCOPED_CSS = """<style>
 .{ns}__boost-banner{{display:flex;align-items:center;gap:.35rem;font-size:.72rem;color:var(--mt-boost);padding:.25rem 0 .15rem;opacity:.85}}
 .{ns}__boost-banner svg{{width:14px;height:14px}}
 .{ns}__boost-banner a{{color:var(--mt-boost);font-weight:600}}
-.{ns}__body{{font-size:.9rem;line-height:1.62;word-break:break-word}}
+.{ns}__body{{font-size:.9rem;line-height:1.62;word-break:break-word;-webkit-hyphens:auto;hyphens:auto}}
+.{ns}__body:empty{{display:none}}
 .{ns}__body a{{color:var(--mt-accent)}}
 .{ns}__body a:hover{{opacity:.8}}
 .{ns}__hashtag{{color:var(--mt-hashtag);font-weight:600;padding:.05em .3em;background:var(--mt-hashtag-bg);border-radius:4px;font-size:.88em}}
@@ -1839,6 +2118,23 @@ SCOPED_CSS = """<style>
 .{ns}__poll-label{{position:relative;z-index:1;font-size:.85rem;color:var(--mt-text);font-weight:500}}
 .{ns}__poll-pct{{position:relative;z-index:1;font-size:.8rem;color:var(--mt-dim);font-weight:600;white-space:nowrap;margin-left:.5rem}}
 .{ns}__poll-footer{{margin-top:.4rem;font-size:.75rem;color:var(--mt-dim)}}
+.{ns}__card-preview{{display:flex;margin-top:.6rem;border:1px solid var(--mt-border);border-radius:8px;overflow:hidden;text-decoration:none!important;color:inherit;transition:border-color .15s}}
+.{ns}__card-preview:hover{{border-color:var(--mt-accent)}}
+.{ns}__card-thumb{{flex:0 0 120px;min-height:80px;background:var(--mt-border)}}
+.{ns}__card-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}
+.{ns}__card-text{{flex:1;min-width:0;padding:.55rem .7rem;display:flex;flex-direction:column;gap:.15rem}}
+.{ns}__card-provider{{font-size:.7rem;color:var(--mt-dim);text-transform:uppercase;letter-spacing:.03em}}
+.{ns}__card-title{{font-size:.82rem;font-weight:600;color:var(--mt-text);line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
+.{ns}__card-desc{{font-size:.75rem;color:var(--mt-dim);line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
+.{ns}__quote{{display:block;margin-top:.6rem;border:1px solid var(--mt-border);border-radius:8px;padding:.6rem .75rem;text-decoration:none!important;color:inherit;transition:border-color .15s}}
+.{ns}__quote:hover{{border-color:var(--mt-accent)}}
+.{ns}__quote-head{{display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;font-size:.78rem}}
+.{ns}__quote-av{{width:18px;height:18px;border-radius:50%;flex-shrink:0}}
+.{ns}__quote-name{{font-weight:600;color:var(--mt-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:10em}}
+.{ns}__quote-handle{{color:var(--mt-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:10em}}
+.{ns}__quote-time{{color:var(--mt-dim);margin-left:auto;white-space:nowrap;font-size:.72rem}}
+.{ns}__quote-body{{font-size:.82rem;line-height:1.45;color:var(--mt-text);display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;-webkit-hyphens:auto;hyphens:auto}}
+.{ns}__quote-body a{{color:var(--mt-accent);pointer-events:none}}
 .{ns}__stats{{display:flex;gap:1rem;margin-top:.6rem;padding-top:.5rem;border-top:1px solid var(--mt-border)}}
 .{ns}__st{{display:inline-flex;align-items:center;gap:.25rem;font-size:.78rem}}
 .{ns}__st svg{{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
@@ -1853,7 +2149,7 @@ SCOPED_CSS = """<style>
 .{ns}__article-chain{{display:flex;flex-direction:column;gap:0}}
 .{ns}__article-post{{padding:.6rem 0;border-top:1px solid var(--mt-border)}}
 .{ns}__article-post:first-child{{border-top:none;padding-top:0}}
-.{ns}__article-body{{line-height:1.55;font-size:.95rem}}
+.{ns}__article-body{{line-height:1.55;font-size:.95rem;-webkit-hyphens:auto;hyphens:auto}}
 .{ns}__article-meta{{margin-top:.3rem;font-size:.72rem;color:var(--mt-dim);display:flex;align-items:center}}
 .{ns}__permalink{{margin-left:auto;color:var(--mt-dim);opacity:.4;transition:opacity .15s}}
 .{ns}__permalink:hover{{opacity:1;color:var(--mt-accent)}}
@@ -1873,7 +2169,29 @@ SCOPED_CSS = """<style>
 .{ns}__nocomments{{text-align:center;padding:1.5rem .5rem;color:var(--mt-dim);font-size:.9rem}}
 @keyframes mt-fadeUp{{from{{opacity:0;transform:translateY(10px)}}to{{opacity:1;transform:translateY(0)}}}}
 .{ns}__toot{{animation:mt-fadeUp .35s ease both}}
+.{ns}__fold{{margin-top:.2rem}}
+.{ns}__fold-toggle{{cursor:pointer;font-size:.78rem;color:var(--mt-accent);font-weight:500;padding:.3rem .6rem;background:var(--mt-border);border-radius:4px;display:inline-block;margin:.2rem 0 .3rem}}
+.{ns}__fold-toggle:hover{{opacity:.8}}
+.{ns}__fold[open]>.{ns}__fold-toggle{{margin-bottom:.4rem;opacity:.6}}
 @media(max-width:520px){{.{ns}-wrap{{--mt-av:36px;padding:.75rem}}.{ns}__card{{padding:.65rem .75rem}}}}
+@media print{{
+.{ns}-wrap{{background:#fff!important;color:#111!important;padding:0;box-shadow:none}}
+.{ns}__card{{background:#fff!important;border:1px solid #ccc!important;box-shadow:none!important;break-inside:avoid}}
+.{ns}__toot--popular>.{ns}__card{{box-shadow:none!important;border-left:3px solid #d97706!important}}
+.{ns}__root>.{ns}__card{{background:#f8f8f8!important}}
+.{ns}__av{{width:24px!important;height:24px!important}}
+.{ns}__body,.{ns}__body a,.{ns}__article-body,.{ns}__article-body a{{color:#111!important}}
+.{ns}__name,.{ns}__handle,.{ns}__time,.{ns}__reply-to,.{ns}__st,.{ns}__poll-footer,.{ns}__card-provider,.{ns}__card-desc,.{ns}__quote-handle,.{ns}__quote-time{{color:#555!important}}
+.{ns}__line{{display:none}}
+.{ns}__fold>summary{{display:none!important}}
+.{ns}__fold>:not(summary){{display:block!important}}
+.{ns}__sensitive>summary{{display:none!important}}
+.{ns}__sensitive>:not(summary){{display:block!important}}
+.{ns}__body a::after,.{ns}__article-body a::after{{content:" (" attr(href) ")";font-size:.7em;color:#888;word-break:break-all}}
+.{ns}__card-preview::after,.{ns}__quote::after,.{ns}__av+*::after{{content:none!important}}
+.{ns}__stats{{font-size:.72rem}}
+.{ns}__boost-banner svg,.{ns}__st svg{{width:12px!important;height:12px!important}}
+}}
 </style>"""
 
 # Ordered list of CSS custom property names (shared by all themes).
@@ -1898,6 +2216,8 @@ _THEME_KEYS = [
     "--mt-mention", "--mt-mention-hover",
     # Polls
     "--mt-poll-bar",
+    # Popular highlight
+    "--mt-popular",
 ]
 
 THEME_DARK = {
@@ -1924,6 +2244,7 @@ THEME_DARK = {
     "--mt-mention":       "#b098e6",
     "--mt-mention-hover": "#c9b5f5",
     "--mt-poll-bar":      "rgba(107,138,255,.18)",
+    "--mt-popular":       "rgba(251,191,36,.35)",
 }
 
 THEME_LIGHT = {
@@ -1950,6 +2271,7 @@ THEME_LIGHT = {
     "--mt-mention":       "#7c5cbf",
     "--mt-mention-hover": "#5a3d9e",
     "--mt-poll-bar":      "rgba(79,93,214,.12)",
+    "--mt-popular":       "rgba(217,119,6,.25)",
 }
 
 
@@ -1992,7 +2314,8 @@ def generate_fragment(root_node, instance, total, toot_url,
                       media_dir=None, media_base_url=None,
                       media_max_age_s=0,
                       article_nocomment=False,
-                      labels=None):
+                      labels=None, highlight_above=0,
+                      fold_depth=0, fold_threshold=0):
     if labels is None:
         labels = DEFAULT_LABELS
     css = scoped_css(theme)
@@ -2029,7 +2352,10 @@ def generate_fragment(root_node, instance, total, toot_url,
         reply_map=_reply_map,
         media_dir=media_dir, media_base_url=media_base_url,
         media_max_age_s=media_max_age_s, labels=labels,
-        seen_boost_ids=set())
+        seen_boost_ids=set(), highlight_above=highlight_above,
+        fold_depth=fold_depth if (fold_depth > 0
+                                  and (fold_threshold <= 0
+                                       or total - 1 >= fold_threshold)) else 0)
     tree_html = render_toot(root_node, depth=0, is_root=True, ctx=ctx)
     esc_inst  = H.escape(instance)
     esc_url   = H.escape(toot_url)
@@ -2182,6 +2508,17 @@ def generate_empty(toot_url, instance, theme="dark", labels=None):
 # Atomic file writing
 # =========================================================================
 
+
+def _content_hash(text):
+    """
+    SHA-256 hex digest of a fragment, ignoring the "Generated …" timestamp
+    so that regeneration with identical settings produces the same hash.
+    """
+    stable = re.sub(
+        r'<div class="[^"]*__generated"[^>]*>.*?</div>', '', text)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
 def _atomic_write(path, content):
     """
     Write *content* to *path* atomically.
@@ -2251,7 +2588,7 @@ def _release_lock(fh):
 # =========================================================================
 
 def write_sidecar(out_dir, toot_id, stammtoot, descendants, blocklist, stats,
-                  whitelist=None, fetched_at=None):
+                  whitelist=None, fetched_at=None, content_hash=None):
     """Write a .json sidecar file alongside the .html.include."""
     op_acct = (stammtoot.get("account", {}).get("acct")
                or stammtoot.get("account", {}).get("username", ""))
@@ -2272,6 +2609,7 @@ def write_sidecar(out_dir, toot_id, stammtoot, descendants, blocklist, stats,
         "latest_toot_date": stats.get("latest_date", ""),
         "total_visible": stats.get("total", 0),
         "unique_users": stats.get("users", 0),
+        "content_hash": content_hash or "",
         "api_data": {
             "stammtoot": stammtoot,
             "descendants": descendants,
@@ -2284,8 +2622,8 @@ def write_sidecar(out_dir, toot_id, stammtoot, descendants, blocklist, stats,
 
 def read_sidecar(out_dir, toot_id):
     """
-    Read a .json sidecar and return (stammtoot, descendants, fetched_at)
-    or None.
+    Read a .json sidecar and return
+    (stammtoot, descendants, fetched_at, content_hash) or None.
     Returns None if the sidecar is missing, corrupt, or lacks api_data.
     """
     path = os.path.join(out_dir, "{}.json".format(toot_id))
@@ -2309,10 +2647,190 @@ def read_sidecar(out_dir, toot_id):
         if not isinstance(stammtoot, dict) or not isinstance(descendants, list):
             return None
         fetched_at = data.get("fetched_at", "")
-        return stammtoot, descendants, fetched_at
+        content_hash = data.get("content_hash", "")
+        return stammtoot, descendants, fetched_at, content_hash
     except (OSError, json.JSONDecodeError, KeyError) as e:
         log_debug("    SIDECAR read failed for {}: {}".format(toot_id, e))
         return None
+
+
+_SIDECAR_REQUIRED = ("sidecar_version", "toot_id", "api_data")
+
+
+def validate_sidecars(toot_cache_dir, active_toot_ids=None):
+    """
+    Validate all .json sidecars in *toot_cache_dir*.
+    Returns a dict with summary counts and per-file issues.
+
+    Checks per sidecar:
+      - valid JSON
+      - required top-level keys (sidecar_version, toot_id, api_data)
+      - sidecar_version <= SIDECAR_VERSION (not from the future)
+      - sidecar_version == SIDECAR_VERSION (up to date)
+      - api_data.stammtoot is a dict with "id" and "account"
+      - api_data.descendants is a list
+      - fetched_at is present and non-empty
+      - matching .html.include exists
+
+    Cross-checks (if active_toot_ids provided):
+      - orphaned sidecars (no matching .markdown source)
+      - missing sidecars (.markdown source but no .json)
+    """
+    issues = []       # list of (filename, severity, message)
+    n_ok = 0
+    n_warn = 0
+    n_error = 0
+    n_checked = 0
+
+    sidecar_tids = set()
+
+    if not os.path.isdir(toot_cache_dir):
+        issues.append(("(dir)", "error",
+                       "Toot cache directory does not exist: {}".format(
+                           toot_cache_dir)))
+        return {"ok": 0, "warn": 0, "error": 1, "checked": 0,
+                "issues": issues}
+
+    for fname in sorted(os.listdir(toot_cache_dir)):
+        if not fname.endswith(".json"):
+            continue
+        if fname.endswith(".deprecated"):
+            continue
+        tid = fname[:-len(".json")]
+        sidecar_tids.add(tid)
+        fpath = os.path.join(toot_cache_dir, fname)
+        n_checked += 1
+        file_ok = True
+
+        # 1. Valid JSON
+        try:
+            with open(fpath, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as e:
+            issues.append((fname, "error",
+                           "Invalid JSON: {}".format(e)))
+            n_error += 1
+            continue
+        except OSError as e:
+            issues.append((fname, "error",
+                           "Cannot read: {}".format(e)))
+            n_error += 1
+            continue
+
+        if not isinstance(data, dict):
+            issues.append((fname, "error",
+                           "Top level is not a JSON object"))
+            n_error += 1
+            continue
+
+        # 2. Required top-level keys
+        for key in _SIDECAR_REQUIRED:
+            if key not in data:
+                issues.append((fname, "error",
+                               "Missing required key: {}".format(key)))
+                n_error += 1
+                file_ok = False
+
+        if not file_ok:
+            continue
+
+        # 3. Version checks
+        ver = data.get("sidecar_version", 1)
+        if not isinstance(ver, int):
+            issues.append((fname, "error",
+                           "sidecar_version is not an integer: {!r}".format(ver)))
+            n_error += 1
+            continue
+        if ver > SIDECAR_VERSION:
+            issues.append((fname, "error",
+                           "Version {} is newer than supported ({})"
+                           .format(ver, SIDECAR_VERSION)))
+            n_error += 1
+            file_ok = False
+        elif ver < SIDECAR_VERSION:
+            issues.append((fname, "warn",
+                           "Version {} is outdated (current: {}), "
+                           "will be upgraded on next write"
+                           .format(ver, SIDECAR_VERSION)))
+            n_warn += 1
+
+        # 4. api_data structure
+        api = data.get("api_data")
+        if not isinstance(api, dict):
+            issues.append((fname, "error",
+                           "api_data is not a dict"))
+            n_error += 1
+            file_ok = False
+        else:
+            st = api.get("stammtoot")
+            if not isinstance(st, dict):
+                issues.append((fname, "error",
+                               "api_data.stammtoot is not a dict"))
+                n_error += 1
+                file_ok = False
+            else:
+                if "id" not in st:
+                    issues.append((fname, "warn",
+                                   "stammtoot missing 'id' field"))
+                    n_warn += 1
+                if "account" not in st:
+                    issues.append((fname, "warn",
+                                   "stammtoot missing 'account' field"))
+                    n_warn += 1
+            desc = api.get("descendants")
+            if not isinstance(desc, list):
+                issues.append((fname, "error",
+                               "api_data.descendants is not a list"))
+                n_error += 1
+                file_ok = False
+
+        # 5. fetched_at
+        fa = data.get("fetched_at")
+        if not fa:
+            issues.append((fname, "warn",
+                           "Missing or empty fetched_at"))
+            n_warn += 1
+
+        # 6. toot_id consistency
+        stored_tid = str(data.get("toot_id", ""))
+        if stored_tid and stored_tid != tid:
+            issues.append((fname, "warn",
+                           "toot_id inside JSON ({}) does not match "
+                           "filename ({})".format(stored_tid, tid)))
+            n_warn += 1
+
+        # 7. Matching .html.include
+        include_path = os.path.join(
+            toot_cache_dir, "{}.html.include".format(tid))
+        if not os.path.isfile(include_path):
+            issues.append((fname, "warn",
+                           "No matching .html.include file"))
+            n_warn += 1
+
+        if file_ok and not any(
+                s == "error" and f == fname for f, s, _ in issues):
+            n_ok += 1
+
+    # Cross-checks with .markdown sources
+    if active_toot_ids is not None:
+        orphaned = sidecar_tids - active_toot_ids
+        missing = active_toot_ids - sidecar_tids
+        for tid in sorted(orphaned):
+            issues.append(("{}.json".format(tid), "warn",
+                           "Orphaned sidecar (no matching .markdown source)"))
+            n_warn += 1
+        for tid in sorted(missing):
+            issues.append(("(missing)", "warn",
+                           "No sidecar for active toot {}".format(tid)))
+            n_warn += 1
+
+    return {
+        "ok": n_ok,
+        "warn": n_warn,
+        "error": n_error,
+        "checked": n_checked,
+        "issues": issues,
+    }
 
 
 # =========================================================================
@@ -2538,6 +3056,7 @@ def _fetch_thread(base_url, toot_id, token, retries, rate_limit):
     """
     Fetch stammtoot and context from API.
     Returns (stammtoot, descendants) or raises RuntimeError.
+    Logs a warning if the server appears to have truncated the response.
     """
     stammtoot = api_get(
         "{}/api/v1/statuses/{}".format(base_url, toot_id), token,
@@ -2546,7 +3065,19 @@ def _fetch_thread(base_url, toot_id, token, retries, rate_limit):
     ctx = api_get(
         "{}/api/v1/statuses/{}/context".format(base_url, toot_id), token,
         retries=retries)
-    return stammtoot, ctx.get("descendants", [])
+    desc = ctx.get("descendants", [])
+
+    # Pagination warning: Mastodon's /context endpoint silently caps at
+    # ~4000 descendants.  Compare with the OP's replies_count (which is
+    # a recursive count maintained by the server).
+    reported = stammtoot.get("replies_count", 0) or 0
+    got = len(desc)
+    if reported > 0 and got > 0 and got < reported * 0.9:
+        log_warn("  WARN  Possible truncation for toot {}: "
+                 "server reports {} replies but only {} descendants "
+                 "returned".format(toot_id, reported, got))
+
+    return stammtoot, desc
 
 
 def _filter_bots(desc, hide_bots):
@@ -2569,7 +3100,9 @@ def _render_thread(stammtoot, desc, fm, instance, full_url,
                    max_toots=0, sort="oldest",
                    custom_emojis=False, article=False,
                    media_dir=None, media_base_url=None,
-                   media_max_age_s=0, labels=None):
+                   media_max_age_s=0, labels=None,
+                   highlight_above=0,
+                   fold_depth=0, fold_threshold=0):
     """
     Build tree, handle article mode, and return the HTML fragment string.
     Shared by process_file and regenerate_file.
@@ -2625,7 +3158,8 @@ def _render_thread(stammtoot, desc, fm, instance, full_url,
         media_dir=media_dir, media_base_url=media_base_url,
         media_max_age_s=media_max_age_s,
         article_nocomment=is_nocomment,
-        labels=labels)
+        labels=labels, highlight_above=highlight_above,
+        fold_depth=fold_depth, fold_threshold=fold_threshold)
     return fragment, stats
 
 
@@ -2666,7 +3200,9 @@ def process_file(filepath, toot_cache_dir, max_age_s, token=None,
                  stale_after_s=0,
                  max_age_stale_s=0,
                  prefix=DEFAULT_PREFIX,
-                 labels=None):
+                 labels=None,
+                 highlight_above=0,
+                 fold_depth=0, fold_threshold=0):
     """
     Returns: ('written'|'cached'|'skipped'|'stale'|'frozen'|'error',
               toot_id_or_None)
@@ -2726,12 +3262,14 @@ def process_file(filepath, toot_cache_dir, max_age_s, token=None,
         max_toots=max_toots, sort=sort,
         custom_emojis=custom_emojis, article=article,
         media_dir=media_dir, media_base_url=media_base_url,
-        media_max_age_s=media_max_age_s, labels=labels)
+        media_max_age_s=media_max_age_s, labels=labels,
+        highlight_above=highlight_above,
+        fold_depth=fold_depth, fold_threshold=fold_threshold)
 
     _atomic_write(out_path, fragment)
 
     write_sidecar(toot_cache_dir, toot_id, stammtoot, desc, blocklist, stats,
-                  whitelist=whitelist)
+                  whitelist=whitelist, content_hash=_content_hash(fragment))
 
     log_info("  OK    {} repl{} -> {}".format(
         len(desc), "ies" if len(desc) != 1 else "y",
@@ -2750,7 +3288,9 @@ def regenerate_file(filepath, toot_cache_dir,
                     media_max_age_s=0,
                     prefix=DEFAULT_PREFIX,
                     ignore_frozen=False,
-                    labels=None):
+                    labels=None,
+                    highlight_above=0,
+                    fold_depth=0, fold_threshold=0):
     """
     Regenerate the .html.include fragment from cached JSON sidecar data.
     No API calls are made.
@@ -2774,7 +3314,7 @@ def regenerate_file(filepath, toot_cache_dir,
         log_warn("  SKIP  {} – no sidecar or missing api_data".format(toot_id))
         return "skipped", toot_id
 
-    stammtoot, desc, orig_fetched_at = cached
+    stammtoot, desc, orig_fetched_at, old_hash = cached
     desc = _filter_bots(desc, hide_bots)
     instance = urlparse(base_url).netloc
     out_path = os.path.join(toot_cache_dir, "{}.html.include".format(toot_id))
@@ -2787,12 +3327,20 @@ def regenerate_file(filepath, toot_cache_dir,
         max_toots=max_toots, sort=sort,
         custom_emojis=custom_emojis, article=article,
         media_dir=media_dir, media_base_url=media_base_url,
-        media_max_age_s=media_max_age_s, labels=labels)
+        media_max_age_s=media_max_age_s, labels=labels,
+        highlight_above=highlight_above,
+        fold_depth=fold_depth, fold_threshold=fold_threshold)
+
+    new_hash = _content_hash(fragment)
+    if old_hash and new_hash == old_hash:
+        log_debug("  UNCHANGED  {} (content hash match)".format(toot_id))
+        return "unchanged", toot_id
 
     _atomic_write(out_path, fragment)
 
     write_sidecar(toot_cache_dir, toot_id, stammtoot, desc, blocklist, stats,
-                  whitelist=whitelist, fetched_at=orig_fetched_at)
+                  whitelist=whitelist, fetched_at=orig_fetched_at,
+                  content_hash=new_hash)
 
     log_info("  REGEN {} repl{} -> {}".format(
         len(desc), "ies" if len(desc) != 1 else "y",
@@ -2977,6 +3525,20 @@ def main():
              "Remaining replies link to the thread on Mastodon. "
              "0 = show all (default: 0)")
     ap.add_argument(
+        "--highlight-above", type=int, default=DEFAULT_HIGHLIGHT,
+        help="Highlight replies with at least this many favourites "
+             "(0 = off). Default: {}".format(DEFAULT_HIGHLIGHT))
+    ap.add_argument(
+        "--fold-depth", type=int, default=DEFAULT_FOLD_DEPTH,
+        help="Fold subtrees at this nesting depth into a "
+             "collapsible <details> element "
+             "(0 = off). Default: {}".format(DEFAULT_FOLD_DEPTH))
+    ap.add_argument(
+        "--fold-threshold", type=int, default=DEFAULT_FOLD_THRESH,
+        help="Only fold when total comment count exceeds this number "
+             "(0 = always fold if fold-depth > 0). "
+             "Default: {}".format(DEFAULT_FOLD_THRESH))
+    ap.add_argument(
         "--sort", choices=["oldest", "newest", "popular"],
         default="oldest",
         help="Sort order for replies: oldest (chronological, default), "
@@ -3027,6 +3589,10 @@ def main():
     ap.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be done, no API calls")
+    ap.add_argument(
+        "--validate", action="store_true",
+        help="Validate all JSON sidecars for integrity "
+             "(no API calls, no writes, exit 1 on errors)")
     ap.add_argument(
         "--no-lock", action="store_true",
         help="Skip lockfile check (allow parallel instances)")
@@ -3082,6 +3648,10 @@ def main():
     os.makedirs(avatar_dir, exist_ok=True)
     os.makedirs(media_dir, exist_ok=True)
 
+    # Register caches for cross-cache collision detection
+    register_cache_dirs(
+        toot=toot_cache_dir, avatar=avatar_dir, media=media_dir)
+
     # --- Lockfile: prevent concurrent runs ---
     lock_fh = None
     if not args.no_lock:
@@ -3094,6 +3664,10 @@ def main():
         except RuntimeError as e:
             log_error("ERROR: {}".format(e))
             sys.exit(1)
+
+    # --- Install signal handlers for graceful shutdown ---
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
 
     # --- Cleanup mode ---
     if args.cleanup_all:
@@ -3135,6 +3709,38 @@ def main():
 
         return
 
+    # --- Validate mode ---
+    if args.validate:
+        if _config_msg:
+            log_info(_config_msg)
+        log_info("VALIDATE  Checking sidecars in {}".format(toot_cache_dir))
+
+        active_ids = collect_all_toot_ids(root_dir, prefix=args.prefix)
+        log_info("          {} active toot ID(s) in .markdown files".format(
+            len(active_ids)))
+
+        result = validate_sidecars(toot_cache_dir, active_toot_ids=active_ids)
+
+        # Print issues grouped by severity
+        for severity in ("error", "warn"):
+            for fname, sev, msg in result["issues"]:
+                if sev != severity:
+                    continue
+                tag = "ERROR" if sev == "error" else "WARN "
+                log_info("  {}  {}: {}".format(tag, fname, msg))
+
+        log_info("")
+        log_info("=" * 50)
+        log_info("  Checked: {} sidecar(s)".format(result["checked"]))
+        log_info("  OK:      {}".format(result["ok"]))
+        log_info("  Warn:    {}".format(result["warn"]))
+        log_info("  Errors:  {}".format(result["error"]))
+        log_info("=" * 50)
+
+        if result["error"]:
+            sys.exit(1)
+        return
+
     # --- Regenerate mode ---
     if args.regenerate or args.regenerate_all:
         ignore_frozen   = args.regenerate_all
@@ -3169,8 +3775,11 @@ def main():
             log_info("LABELS      {}".format(args.labels))
         log_info("")
 
-        stats = {"written": 0, "skipped": 0, "frozen": 0, "error": 0}
+        stats = {"written": 0, "unchanged": 0, "skipped": 0, "frozen": 0, "error": 0}
         for filepath in files:
+            if _shutdown_requested:
+                log_info("  SHUTDOWN  stopping after signal")
+                break
             rel = os.path.relpath(filepath, root_dir)
             fm = parse_frontmatter(filepath)
             if fm is None or not is_enabled(fm):
@@ -3194,12 +3803,19 @@ def main():
                 media_max_age_s=media_max_age_s,
                 prefix=args.prefix,
                 ignore_frozen=ignore_frozen,
-                labels=labels)
+                labels=labels,
+                highlight_above=args.highlight_above,
+                fold_depth=args.fold_depth,
+                fold_threshold=args.fold_threshold)
             stats[result] = stats.get(result, 0) + 1
 
         log_info("")
         log_info("=" * 50)
+        if _shutdown_requested:
+            log_info("  (Interrupted by signal – partial run)")
         log_info("  Regenerated: {}".format(stats["written"]))
+        if stats["unchanged"]:
+            log_info("  Unchanged:   {}".format(stats["unchanged"]))
         if stats["frozen"]:
             log_info("  Frozen:      {}".format(stats["frozen"]))
         log_info("  Skipped:     {} (no sidecar or disabled)".format(
@@ -3271,6 +3887,9 @@ def main():
     active_ids = set()
 
     for filepath in files:
+        if _shutdown_requested:
+            log_info("  SHUTDOWN  stopping after signal")
+            break
         rel = os.path.relpath(filepath, root_dir)
 
         fm = parse_frontmatter(filepath)
@@ -3307,7 +3926,10 @@ def main():
             stale_after_s=stale_after_s,
             max_age_stale_s=max_age_stale_s,
             prefix=args.prefix,
-            labels=labels)
+            labels=labels,
+            highlight_above=args.highlight_above,
+            fold_depth=args.fold_depth,
+            fold_threshold=args.fold_threshold)
         stats[result] = stats.get(result, 0) + 1
         if tid:
             active_ids.add(tid)
@@ -3317,6 +3939,8 @@ def main():
 
     log_info("")
     log_info("=" * 50)
+    if _shutdown_requested:
+        log_info("  (Interrupted by signal – partial run)")
     if args.dry_run:
         log_info("  (Dry run - nothing was written)")
     else:
