@@ -110,6 +110,9 @@ python3 toot.py [options] directory
 | `--max-depth N` | `5` | Maximum nesting depth for replies. Deeper replies are rendered at the max level |
 | `--sort {oldest,newest,popular}` | `oldest` | Sort order for replies. `popular` sorts by favourite count |
 | `--max-toots N` | `0` (all) | Maximum number of replies to display. Excess replies are replaced with a link to the thread on Mastodon |
+| `--highlight-above N` | `10` | Highlight replies with at least N favourites (golden accent border). Set to 0 to disable |
+| `--fold-depth N` | `3` | Fold subtrees at this nesting depth into a collapsible `<details>` element. Set to 0 to disable |
+| `--fold-threshold N` | `50` | Only fold when total comment count exceeds this number. Set to 0 to always fold (when fold-depth > 0) |
 
 ### Caching
 
@@ -118,10 +121,10 @@ python3 toot.py [options] directory
 | `--toot-cache-dir DIR` | `/var/tmp/gencache/mastodontootcache` | Directory for `.html.include` and `.json` sidecar files |
 | `--max-age HOURS` | `3` | Maximum age of cached HTML before re-fetching |
 | `--avatar-dir DIR` | `/var/tmp/gencache/mastodonavatarcache` | Directory for downloaded avatar images |
-| `--avatar-url URL` | `https://www.webserver.example.com/images/mastodonavatarcache` | Public base URL to serve avatars from |
+| `--avatar-url URL` | `https://www.blog.example.com/images/mastodonavatarcache` | Public base URL to serve avatars from |
 | `--avatar-max-age DAYS` | `30` | Maximum age of cached avatars before re-downloading |
-| `--media-dir DIR` | `/var/tmp/gencache/mastodonmediacache` | Directory for cached OP media files (images, videos) |
-| `--media-url URL` | `https://www.webserver.example.com/images/mastodonmediacache` | Public base URL to serve cached media from |
+| `--media-dir DIR` | `/var/tmp/gencache/mastodonmediacache` | Directory for cached OP media files (images, videos) and link preview thumbnails |
+| `--media-url URL` | `https://www.blog.example.com/images/mastodonmediacache` | Public base URL to serve cached media from |
 | `--media-max-age DAYS` | `30` | Maximum age of cached media before re-downloading |
 
 ### Filtering
@@ -164,6 +167,7 @@ python3 toot.py [options] directory
 | `--regenerate-all` | off | Like `--regenerate` but also processes frozen threads |
 | `--dry-run` | off | Show what would be done without making API calls or writing files |
 | `--no-lock` | off | Skip lockfile check, allowing parallel instances |
+| `--validate` | off | Validate all JSON sidecars for integrity (no API calls, no writes). Exit 1 on errors, exit 0 on warnings only |
 
 ### Logging
 
@@ -201,10 +205,10 @@ theme = dark
 toot_cache_dir = /var/tmp/gencache/mastodontootcache
 max_age = 3
 avatar_dir = /var/tmp/gencache/mastodonavatarcache
-avatar_url = https://www.webserver.example.com/images/mastodonavatarcache
+avatar_url = https://www.blog.example.com/images/mastodonavatarcache
 avatar_max_age = 30
 media_dir = /var/tmp/gencache/mastodonmediacache
-media_url = https://www.webserver.example.com/images/mastodonmediacache
+media_url = https://www.blog.example.com/images/mastodonmediacache
 media_max_age = 30
 stale_after = 12m
 max_age_stale = 7
@@ -216,6 +220,9 @@ rate_limit = 5
 max_depth = 5
 retries = 3
 max_toots = 0
+highlight_above = 10
+fold_depth = 3
+fold_threshold = 50
 sort = oldest
 since = 4
 hide_bots = false
@@ -254,7 +261,7 @@ User avatars are downloaded once and served from a local directory. The filename
 
 ### Media Cache
 
-Images and videos from the OP's toots are downloaded and cached locally in `--media-dir`. Like avatars, each file is stored with a SHA-256 hash of its original URL as the filename, preserving the file extension. The cached files are served from the `--media-url` base URL instead of the original Mastodon CDN. Media is re-downloaded when `--media-max-age` days have passed. This ensures media remains available even if the original instance goes down or purges old media. Media from non-OP toots is not cached (non-OP media is not embedded – only linked).
+Images and videos from the OP's toots are downloaded and cached locally in `--media-dir`. Like avatars, each file is stored with a SHA-256 hash of its original URL as the filename, preserving the file extension. The cached files are served from the `--media-url` base URL instead of the original Mastodon CDN. Media is re-downloaded when `--media-max-age` days have passed. This ensures media remains available even if the original instance goes down or purges old media. Link preview card thumbnails (OpenGraph images) are also cached through the same mechanism. Media from non-OP toots is not cached (non-OP media is not embedded – only linked).
 
 ### Stale Thread Skipping
 
@@ -312,6 +319,20 @@ python3 toot.py /site-b/content/ --toot-cache-dir /cache/b/ --no-lock &
 
 On systems without `flock()` support (e.g. Windows), locking is silently skipped.
 
+### Validation
+
+`--validate` checks all JSON sidecars for integrity without making API calls or writing any files:
+
+```bash
+python3 toot.py /path/to/content/ --validate
+```
+
+Each sidecar is checked for valid JSON, required fields (`sidecar_version`, `toot_id`, `api_data`), version compatibility, `api_data` structure (stammtoot must be a dict with `id` and `account`, descendants must be a list), presence of `fetched_at`, consistency between the toot ID in the filename and the stored `toot_id`, and existence of a matching `.html.include` file.
+
+Cross-checks against `.markdown` sources report orphaned sidecars (no matching source) and missing sidecars (source exists but no cached JSON).
+
+Structural problems (corrupt JSON, missing required keys, future version, bad api_data) are errors. Outdated versions, missing metadata, and orphaned/missing sidecars are warnings. Exit code is 1 if any errors are found, 0 otherwise (warnings alone do not cause a non-zero exit).
+
 ### Cleanup
 
 Over time, cache files accumulate for deleted or changed posts. Three cleanup modes are available:
@@ -356,7 +377,9 @@ By default, `--regenerate` skips threads marked with `mastodonfreeze: true`. Use
 python3 toot.py --regenerate-all --theme light /path/to/content/
 ```
 
-Settings that take effect on regeneration include: `--theme`, `--blocklist`, `--whitelist`, `--max-depth`, `--max-toots`, `--sort`, `--hide-bots`, `--custom-emojis`, `--article`, avatar/media URL mappings.
+Settings that take effect on regeneration include: `--theme`, `--blocklist`, `--whitelist`, `--max-depth`, `--max-toots`, `--highlight-above`, `--fold-depth`, `--fold-threshold`, `--sort`, `--hide-bots`, `--custom-emojis`, `--article`, avatar/media URL mappings.
+
+Regeneration is incremental: a SHA-256 hash of the generated HTML (excluding the "Generated …" timestamp) is stored in the sidecar. On the next `--regenerate`, the new output is compared against the stored hash — if identical, the file is not rewritten. This preserves file modification times and avoids unnecessary I/O, which is relevant for build systems that trigger on mtime changes. If settings change (e.g. `--theme`), the hash will differ and the file is rewritten.
 
 ---
 
@@ -448,6 +471,8 @@ voters = {n} Abstimmende
 voters_1 = {n} Abstimmende/r
 votes = {n} Stimmen
 votes_1 = {n} Stimme
+fold_replies = {n} weitere Antworten
+fold_replies_1 = {n} weitere Antwort
 
 # ARIA
 post_by_aria = Beitrag von {handle}
@@ -620,8 +645,12 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 | **Reply-to indicator** | Replies at depth ≥ 2 show "↩ @username" to clarify who they're responding to |
 | **Content warnings** | Spoiler text is shown as a collapsible "Show content" block |
 | **Sensitive media** | Images/videos marked sensitive are wrapped in a click-to-reveal element |
+| **Empty body suppression** | Toots with no text content (e.g. media-only posts, empty boost wrappers) omit the body element entirely, avoiding blank gaps in the layout |
 | **Alt-text badge** | Images with alt text show an "ALT" badge in the bottom-left corner. Hover or click to read the full description |
 | **Media gating** | Only the OP's media is embedded inline. Non-OP media shows a link to the original toot ("1 media attachment – view on original toot ↗") |
+| **Responsive images** | OP images use `srcset` with the preview (~400px) and original resolution, both cached locally. The browser picks the smallest sufficient source based on viewport width, saving bandwidth on mobile |
+| **Link preview cards** | When an OP toot contains a link preview (OpenGraph card), it is rendered as a compact box with thumbnail, title, description, and provider. Thumbnails are cached locally via the media cache. Cards are suppressed when the toot has media attachments (matching Mastodon's behavior) |
+| **Quoted toots** | Mastodon 4.3+ quote posts are rendered as an embedded box showing the quoted author's avatar, handle, timestamp, and body text (clamped to 4 lines). Clicking the box opens the original quoted toot. Works for all toots (OP and non-OP), coexists with media and cards |
 | **Polls** | Rendered as bar charts with vote counts and percentages |
 | **Custom emojis** | `:shortcode:` patterns replaced with inline images (opt-in via `--custom-emojis`) |
 | **Verified badges** | Users with verified profile links get a ✓ badge |
@@ -633,11 +662,17 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 | **ARIA labels** | Full accessibility markup: `role="article"` on toot cards, `role="region"` on wrapper, `aria-label` on stats and interactive elements, `aria-hidden` on decorative SVGs and thread lines |
 | **SEO-safe links** | Non-OP links (profile, toot, body, media) get `rel="nofollow ugc noopener"`. OP links remain trusted with only `rel="noopener"` |
 | **Semantic `<time>` elements** | All timestamps (posted, edited) use `<time datetime="...">` for machine-readable dates |
+| **Language tags** | Toot bodies carry a `lang` attribute from the Mastodon API (e.g. `lang="de"`), enabling correct screenreader pronunciation and CSS auto-hyphenation |
 | **Sidecar versioning** | JSON sidecars include a `sidecar_version` field. Newer toot.py versions can read older sidecars; sidecars from future versions are skipped with a warning |
+| **Regenerate skip** | `--regenerate` compares a SHA-256 content hash before writing. Unchanged fragments are skipped, preserving file mtime and avoiding unnecessary I/O |
 | **Atomic writes** | All file writes (`.html.include` and `.json`) use temp-file-then-rename, so a crash never leaves corrupt files. Corrupt sidecars are skipped gracefully |
+| **Cross-cache collision detection** | At startup, warns if cache directories overlap (e.g. `--avatar-dir` == `--media-dir`). At runtime, warns before writing a file that already exists in a different cache. Also detects the (astronomically unlikely) case of two different URLs producing the same SHA-256 hash within a single cache |
 | **Exit codes** | Exit 0 on success, exit 1 on errors. Enables `set -e` in build scripts and CI/CD error detection |
+| **Graceful SIGTERM/SIGINT** | On `SIGTERM` or `SIGINT` (Ctrl+C), the current thread finishes processing (atomic write completes), then the loop stops and prints a summary with "(Interrupted by signal – partial run)". No data is left in an inconsistent state |
 | **Auto theme** | `--theme auto` emits both dark and light schemes via `@media (prefers-color-scheme)`. No JavaScript needed |
+| **Print stylesheet** | `@media print` rules override colors to white background, force-open all folds and sensitive content, shrink avatars, hide decorative thread lines, print link URLs inline, and add `break-inside:avoid` on toot cards. Works with all themes |
 | **Lockfile** | Exclusive `flock()`-based lockfile prevents concurrent instances from corrupting shared cache. Disable with `--no-lock` |
+| **Sidecar validation** | `--validate` checks all JSON sidecars for structural integrity, version compatibility, and cross-references with `.markdown` sources. No API calls, no writes |
 
 ### Operational Features
 
@@ -645,6 +680,8 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 |---------|-------------|
 | **Incremental processing** | Only re-fetches threads when cache has expired |
 | **Rate limiting** | Configurable minimum delay between API calls (default: 5s). Mastodon's `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers are evaluated after each response; when the server requires a longer wait, that value overrides the configured minimum. 429 responses respect `Retry-After` |
+| **Pagination warning** | Logs a warning when the server's `/context` response appears truncated (fewer descendants returned than the root toot's `replies_count` suggests). Mastodon silently caps at ~4000 descendants |
+| **Charset fallback** | API responses are decoded using the charset from the server's `Content-Type` header, falling back to UTF-8. Handles edge cases with reverse proxies or non-standard server configurations |
 | **Retry with backoff** | Transient errors (429, 5xx, network) trigger automatic retries with exponential backoff |
 | **Stale thread detection** | Threads with no new reply beyond a configurable threshold (default: 12 months) use a longer cache TTL (`--max-age-stale`, default: 7 days) instead of the normal `--max-age`. Stale threads are still re-checked periodically, just less frequently |
 | **Frozen threads** | Per-post `mastodonfreeze: true` frontmatter to permanently skip regeneration, preserving the existing include file |
@@ -653,6 +690,8 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 | **Media caching** | OP media (images, videos) are downloaded and served from a local cache, ensuring long-term availability |
 | **Thread statistics** | Footer shows toot count, unique user count |
 | **Thread truncation** | `--max-toots` limits displayed replies with a "N more replies" link |
+| **Popular highlighting** | Replies with ≥ N favourites (default 10) get a golden accent border, making them easy to spot in long threads. Disable with `--highlight-above 0` |
+| **Foldable deep threads** | Subtrees at or beyond `--fold-depth` (default 3) are collapsed into a clickable `<details>` element ("N more replies"). Only activates when total comments exceed `--fold-threshold` (default 50). Pure HTML/CSS, no JavaScript |
 
 ---
 
@@ -718,6 +757,8 @@ python3 toot.py \
 # Hourly: refresh comments
 0 * * * * python3 /opt/toot.py --config /etc/toot.ini --quiet /srv/blog/content/
 ```
+
+When running under systemd timers or in containers, toot.py handles `SIGTERM` gracefully: the current thread finishes writing (atomic write completes), the loop stops, and a summary is printed. `SIGINT` (Ctrl+C) is handled identically.
 
 ---
 
@@ -828,6 +869,10 @@ Another process holds the lockfile. Check for running cron jobs or background pr
 
 The Mastodon instance is throttling requests. The script reads `Retry-After` headers and waits accordingly. It also monitors `X-RateLimit-Remaining` and automatically slows down when the budget gets low. If you still see 429 errors, increase `--rate-limit` to add more time between calls.
 
+### "Possible truncation" warning
+
+Mastodon's `/context` API endpoint silently caps the number of returned descendants (typically around 4000). The script detects this by comparing the number of descendants received against the root toot's `replies_count`. This is a server-side limitation that cannot be worked around — the warning is informational only. Very large threads will show fewer replies than actually exist.
+
 ### Stale comments
 
 Cached HTML is served until `--max-age` expires. Use `--force` to re-fetch immediately, or reduce `--max-age` for more frequent updates.
@@ -839,6 +884,14 @@ Ensure `--avatar-dir` points to a directory your web server can read, and `--ava
 ### Missing or broken OP images
 
 If OP media shows broken images, check that `--media-dir` is writable and `--media-url` matches the public URL that directory is served from. If the original media download failed, toot.py falls back to the original Mastodon CDN URL.
+
+### "Cache directory overlap" warning
+
+This appears when two or more of `--toot-cache-dir`, `--avatar-dir`, and `--media-dir` point to the same directory. While this won't crash, it means avatar and media files share the same directory — `--cleanup-avatars` or `--cleanup-media` may incorrectly delete each other's files. Use separate directories for each cache.
+
+### "Hash collision" warning
+
+This means two different URLs produced the same SHA-256 filename within a single cache directory. With SHA-256 this is astronomically unlikely (1 in 2^128 for a targeted collision), so this almost certainly indicates a bug rather than a genuine hash collision. If you see this warning, please report it — the second URL's content will overwrite the first.
 
 ### Empty thread / "0 comments"
 
