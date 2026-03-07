@@ -33,6 +33,7 @@ import sys
 import os
 import signal
 import tempfile
+import threading
 import time
 import html as H
 import re
@@ -69,6 +70,8 @@ DEFAULT_MAX_DEPTH   = 5        # max nesting depth
 DEFAULT_HIGHLIGHT   = 10       # min favourites to highlight a toot
 DEFAULT_FOLD_DEPTH  = 3        # fold subtrees at this depth
 DEFAULT_FOLD_THRESH = 50       # only fold if total comments exceed this
+DEFAULT_MAX_MEDIA   = 3        # max media attachments to embed per toot
+DEFAULT_TIMEOUT     = 3540     # seconds (59 minutes) – global run timeout
 DEFAULT_SINCE_WEEKS = 4        # only process posts from last N weeks
 DEFAULT_RETRIES     = 3        # API retry attempts
 DEFAULT_STALE_AFTER = "12m"    # skip threads with no reply for 12 months
@@ -101,6 +104,8 @@ DEFAULT_LABELS = {
     # Media placeholder (non-OP)
     "media_link":           "{n} media attachments &ndash; view on original toot",
     "media_link_1":         "{n} media attachment &ndash; view on original toot",
+    "media_more":           "{n} more media &ndash; view on original toot",
+    "media_more_1":         "{n} more &ndash; view on original toot",
 
     # Poll
     "poll_aria":            "Poll",
@@ -257,6 +262,9 @@ _CONFIG_KEYS = {
     "highlight_above":("highlight_above", int),
     "fold_depth":     ("fold_depth",      int),
     "fold_threshold": ("fold_threshold",  int),
+    "max_media":      ("max_media",       int),
+    "css_extra":      ("css_extra",       str),
+    "timeout":        ("timeout",         int),
     "sort":           ("sort",           str),
     "since":          ("since",          int),
 }
@@ -757,6 +765,13 @@ def _shutdown_handler(signum, frame):
     log_warn("  {}  received, finishing current thread...".format(sig_name))
 
 
+def _timeout_expired():
+    """Called by threading.Timer when --timeout seconds have elapsed."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    log_warn("  TIMEOUT  time limit reached, finishing current thread...")
+
+
 def _parse_ratelimit_headers(http_headers):
     """
     Extract X-RateLimit-Remaining and X-RateLimit-Reset from
@@ -780,6 +795,21 @@ def _parse_ratelimit_headers(http_headers):
         except (ValueError, TypeError):
             pass
     return {"remaining": remaining, "reset": reset_ts}
+
+
+def _interruptible_sleep(seconds):
+    """
+    Sleep for *seconds*, but check _shutdown_requested every second.
+    Returns early if a shutdown signal was received.
+    """
+    end = time.time() + seconds
+    while time.time() < end:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 1.0))
+        if _shutdown_requested:
+            break
 
 
 def _rate_limit_sleep(min_wait=0):
@@ -810,7 +840,7 @@ def _rate_limit_sleep(min_wait=0):
                   "(server {:.1f}s > configured {}s)".format(
                       remaining, total, server_delay, min_wait))
     if total > 0:
-        time.sleep(total)
+        _interruptible_sleep(total)
 
 
 def api_get(url, token=None, retries=3):
@@ -854,13 +884,13 @@ def api_get(url, token=None, retries=3):
                         pass
             log_debug("  RETRY {}/{} in {}s: {}".format(
                 attempt + 1, retries, wait, last_err))
-            time.sleep(wait)
+            _interruptible_sleep(wait)
         except URLError as e:
             last_err = "Network: {} - {}".format(e.reason, url)
             wait = 2 ** (attempt + 1)
             log_debug("  RETRY {}/{} in {}s: {}".format(
                 attempt + 1, retries, wait, last_err))
-            time.sleep(wait)
+            _interruptible_sleep(wait)
 
     raise RuntimeError(last_err or "Request failed after {} attempts".format(retries))
 
@@ -922,6 +952,43 @@ def clean(raw, ugc=False):
     return p.result()
 
 
+# Regex matching characters commonly found in emoji-only messages:
+# emoji codepoints, variation selectors, zero-width joiners, skin tones.
+_EMOJI_CODEPOINTS = re.compile(
+    u"["
+    u"\U0000200D"              # zero-width joiner
+    u"\U0000FE0E\U0000FE0F"   # variation selectors
+    u"\U00002600-\U000027BF"   # misc symbols, dingbats
+    u"\U0001F300-\U0001FAFF"   # all emoji blocks
+    u"\U00002702-\U000027B0"
+    u"\U000024C2-\U0001F251"
+    u"\U0001F900-\U0001F9FF"
+    u"\U0001FA00-\U0001FAFF"
+    u"\U00002764"              # heavy heart
+    u"\U0001F1E0-\U0001F1FF"   # flags
+    u"\U0000203C\U00002049"    # ‼ ⁉
+    u"\U000020E3"              # combining enclosing keycap
+    u"\U00000023\U0000002A"    # # *
+    u"\U00000030-\U00000039"   # 0-9 (for keycap sequences)
+    u"]+")
+
+_TAG_STRIP = re.compile(r"<[^>]+>")
+
+
+def _is_emoji_only(html_body, max_chars=10):
+    """
+    Return True if *html_body* (cleaned HTML) contains only 1 to
+    *max_chars* emoji codepoints (plus whitespace / variation selectors).
+    Used to detect emoji-reaction toots like '👍' or '❤️🔥'.
+    """
+    text = _TAG_STRIP.sub("", html_body).strip()
+    if not text or len(text) > max_chars:
+        return False
+    stripped = _EMOJI_CODEPOINTS.sub("", text)
+    # After removing all emoji chars, only whitespace should remain
+    return stripped.strip() == ""
+
+
 def render_alt_badge(alt_text):
     """Return an ALT badge element if alt_text is non-empty."""
     if not alt_text:
@@ -934,14 +1001,25 @@ def render_alt_badge(alt_text):
 
 
 def _render_media_html(attachments, media_dir=None, media_base_url=None,
-                       media_max_age_s=0):
+                       media_max_age_s=0, max_media=0, toot_url="",
+                       labels=None):
     """
     Render media attachments (image, video, gifv, audio) to HTML.
     Returns the concatenated HTML string (empty if no attachments).
     Used by both render_article_block and render_toot for OP media.
+    If *max_media* > 0 and there are more attachments, only the first
+    *max_media* are embedded; the rest are replaced with a link.
     """
+    if labels is None:
+        labels = DEFAULT_LABELS
+    show = attachments
+    extra = 0
+    if max_media > 0 and len(attachments) > max_media:
+        show = attachments[:max_media]
+        extra = len(attachments) - max_media
+
     parts = []
-    for m in attachments:
+    for m in show:
         raw_u   = m.get("url", "")
         raw_pre = m.get("preview_url", raw_u)
         u   = H.escape(resolve_media_src(
@@ -982,6 +1060,18 @@ def _render_media_html(attachments, media_dir=None, media_base_url=None,
             parts.append(
                 '<div class="{0}__media"><audio controls preload="metadata"'
                 ' src="{1}"></audio></div>'.format(NS, u))
+
+    if extra > 0 and toot_url:
+        esc_url = H.escape(toot_url)
+        more_label = _pl(labels, "media_more", extra).format(n=extra)
+        parts.append(
+            '<div class="{ns}__media-link">'
+            '<a href="{url}" target="_blank"'
+            ' rel="nofollow ugc noopener">'
+            '{svg} {label} &#8599;</a></div>'.format(
+                ns=NS, url=esc_url,
+                svg=SVG_MEDIA,
+                label=more_label))
 
     return "".join(parts)
 
@@ -1296,7 +1386,7 @@ def render_article_block(root_data, chain, avatar_dir=None,
                          custom_emojis=False,
                          media_dir=None, media_base_url=None,
                          media_max_age_s=0,
-                         labels=None):
+                         labels=None, max_media=0):
     """
     Render the OP's article chain as a sequential block (no nesting).
     Returns HTML string.
@@ -1333,10 +1423,12 @@ def render_article_block(root_data, chain, avatar_dir=None,
             edited_tag = ""
 
         # Media
+        raw_url = t.get("url") or t.get("uri", "#")
         media = _render_media_html(
             t.get("media_attachments", []),
             media_dir=media_dir, media_base_url=media_base_url,
-            media_max_age_s=media_max_age_s)
+            media_max_age_s=media_max_age_s,
+            max_media=max_media, toot_url=raw_url, labels=labels)
         media = _wrap_sensitive(media, t.get("sensitive", False), labels)
 
         # Link preview card (skip if media attachments present)
@@ -1561,7 +1653,7 @@ class RenderContext:
         "article_ids", "op_acct", "reply_map",
         "media_dir", "media_base_url", "media_max_age_s",
         "labels", "counter", "seen_boost_ids",
-        "highlight_above", "fold_depth",
+        "highlight_above", "fold_depth", "max_media",
     )
 
     def __init__(self, blocklist=None, whitelist=None,
@@ -1570,7 +1662,7 @@ class RenderContext:
                  article_ids=None, op_acct=None, reply_map=None,
                  media_dir=None, media_base_url=None, media_max_age_s=0,
                  labels=None, counter=None, seen_boost_ids=None,
-                 highlight_above=0, fold_depth=0):
+                 highlight_above=0, fold_depth=0, max_media=0):
         self.blocklist = blocklist
         self.whitelist = whitelist
         self.avatar_dir = avatar_dir
@@ -1589,6 +1681,7 @@ class RenderContext:
         self.seen_boost_ids = seen_boost_ids
         self.highlight_above = highlight_above
         self.fold_depth = fold_depth
+        self.max_media = max_media
 
 
 def render_toot(node, depth=0, is_root=False, ctx=None):
@@ -1882,18 +1975,22 @@ def render_toot(node, depth=0, is_root=False, ctx=None):
     if body_html.strip():
         lang = t.get("language") or ""
         lang_attr = ' lang="{}"'.format(H.escape(lang)) if lang else ""
-        body_html = '<div class="{ns}__body"{lang}>{b}</div>'.format(
-            ns=NS, lang=lang_attr, b=body_html)
+        emoji_cls = " {ns}__body--emoji".format(ns=NS) if _is_emoji_only(body_html) else ""
+        body_html = '<div class="{ns}__body{ecls}"{lang}>{b}</div>'.format(
+            ns=NS, ecls=emoji_cls, lang=lang_attr, b=body_html)
     else:
         body_html = ""
 
     # Media (only for OP's toots)
     media = ""
     if is_op:
+        raw_toot_url = t.get("url") or t.get("uri", "#")
         media = _render_media_html(
             t.get("media_attachments", []),
             media_dir=media_dir, media_base_url=media_base_url,
-            media_max_age_s=media_max_age_s)
+            media_max_age_s=media_max_age_s,
+            max_media=ctx.max_media, toot_url=raw_toot_url,
+            labels=labels)
     else:
         n_att = len(t.get("media_attachments", []))
         if n_att:
@@ -2083,6 +2180,7 @@ SCOPED_CSS = """<style>
 .{ns}__boost-banner a{{color:var(--mt-boost);font-weight:600}}
 .{ns}__body{{font-size:.9rem;line-height:1.62;word-break:break-word;-webkit-hyphens:auto;hyphens:auto}}
 .{ns}__body:empty{{display:none}}
+.{ns}__body--emoji{{font-size:2rem;line-height:1.4;letter-spacing:.1em}}
 .{ns}__body a{{color:var(--mt-accent)}}
 .{ns}__body a:hover{{opacity:.8}}
 .{ns}__hashtag{{color:var(--mt-hashtag);font-weight:600;padding:.05em .3em;background:var(--mt-hashtag-bg);border-radius:4px;font-size:.88em}}
@@ -2315,10 +2413,13 @@ def generate_fragment(root_node, instance, total, toot_url,
                       media_max_age_s=0,
                       article_nocomment=False,
                       labels=None, highlight_above=0,
-                      fold_depth=0, fold_threshold=0):
+                      fold_depth=0, fold_threshold=0,
+                      max_media=0, css_extra=""):
     if labels is None:
         labels = DEFAULT_LABELS
     css = scoped_css(theme)
+    if css_extra:
+        css += "\n<style>\n{}\n</style>".format(css_extra)
 
     # Sort tree before rendering
     if sort != "oldest":
@@ -2355,7 +2456,8 @@ def generate_fragment(root_node, instance, total, toot_url,
         seen_boost_ids=set(), highlight_above=highlight_above,
         fold_depth=fold_depth if (fold_depth > 0
                                   and (fold_threshold <= 0
-                                       or total - 1 >= fold_threshold)) else 0)
+                                       or total - 1 >= fold_threshold)) else 0,
+        max_media=max_media)
     tree_html = render_toot(root_node, depth=0, is_root=True, ctx=ctx)
     esc_inst  = H.escape(instance)
     esc_url   = H.escape(toot_url)
@@ -2833,6 +2935,129 @@ def validate_sidecars(toot_cache_dir, active_toot_ids=None):
     }
 
 
+# All top-level keys a current (v2) sidecar should have, with defaults
+# for fields that might be missing in older versions.
+_SIDECAR_DEFAULTS = {
+    "sidecar_version": SIDECAR_VERSION,
+    "toot_id":         "",
+    "reply_count":     0,
+    "fetched_at":      "",
+    "regenerated_at":  None,
+    "filtered_toots":  [],
+    "latest_toot_date":"",
+    "total_visible":   0,
+    "unique_users":    0,
+    "content_hash":    "",
+    "api_data":        None,   # required, never auto-filled
+}
+
+
+def migrate_sidecars(toot_cache_dir):
+    """
+    Upgrade all .json sidecars in *toot_cache_dir* to current
+    SIDECAR_VERSION.  Adds missing fields with sensible defaults,
+    recomputes reply_count from api_data if available.
+    No API calls.
+
+    Returns dict: {migrated, skipped, error, checked}
+    """
+    n_migrated = 0
+    n_skipped = 0
+    n_error = 0
+    n_checked = 0
+
+    if not os.path.isdir(toot_cache_dir):
+        log_error("ERROR: Toot cache directory does not exist: {}".format(
+            toot_cache_dir))
+        return {"migrated": 0, "skipped": 0, "error": 1, "checked": 0}
+
+    for fname in sorted(os.listdir(toot_cache_dir)):
+        if not fname.endswith(".json"):
+            continue
+        if fname.endswith(".deprecated"):
+            continue
+        tid = fname[:-len(".json")]
+        fpath = os.path.join(toot_cache_dir, fname)
+        n_checked += 1
+
+        # Read
+        try:
+            with open(fpath, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError) as e:
+            log_warn("  ERROR  {}: cannot read ({})".format(fname, e))
+            n_error += 1
+            continue
+
+        if not isinstance(data, dict):
+            log_warn("  ERROR  {}: top level is not a dict".format(fname))
+            n_error += 1
+            continue
+
+        ver = data.get("sidecar_version", 1)
+        if ver > SIDECAR_VERSION:
+            log_warn("  SKIP   {}: version {} is newer than supported ({})".format(
+                fname, ver, SIDECAR_VERSION))
+            n_skipped += 1
+            continue
+
+        # Check if migration is needed
+        needs_update = ver < SIDECAR_VERSION
+        for key in _SIDECAR_DEFAULTS:
+            if key == "api_data":
+                continue  # never auto-fill
+            if key not in data:
+                needs_update = True
+                break
+
+        if not needs_update:
+            log_debug("  OK     {}: already current (v{})".format(fname, ver))
+            n_skipped += 1
+            continue
+
+        # Apply defaults for missing fields
+        changed = []
+        for key, default in _SIDECAR_DEFAULTS.items():
+            if key == "api_data":
+                continue
+            if key not in data:
+                data[key] = default
+                changed.append(key)
+
+        # Recompute reply_count from api_data if available
+        api = data.get("api_data")
+        if isinstance(api, dict):
+            desc = api.get("descendants")
+            if isinstance(desc, list):
+                data["reply_count"] = len(desc)
+
+        # Ensure toot_id matches filename
+        if not data.get("toot_id"):
+            data["toot_id"] = tid
+
+        # Bump version
+        old_ver = data.get("sidecar_version", 1)
+        data["sidecar_version"] = SIDECAR_VERSION
+
+        # Write back atomically
+        _atomic_write(fpath, json.dumps(data, indent=2, ensure_ascii=False))
+        n_migrated += 1
+
+        parts = []
+        if old_ver < SIDECAR_VERSION:
+            parts.append("v{} -> v{}".format(old_ver, SIDECAR_VERSION))
+        if changed:
+            parts.append("added: {}".format(", ".join(changed)))
+        log_info("  MIGRATE  {}: {}".format(fname, "; ".join(parts)))
+
+    return {
+        "migrated": n_migrated,
+        "skipped": n_skipped,
+        "error": n_error,
+        "checked": n_checked,
+    }
+
+
 # =========================================================================
 # Cache freshness
 # =========================================================================
@@ -3102,7 +3327,8 @@ def _render_thread(stammtoot, desc, fm, instance, full_url,
                    media_dir=None, media_base_url=None,
                    media_max_age_s=0, labels=None,
                    highlight_above=0,
-                   fold_depth=0, fold_threshold=0):
+                   fold_depth=0, fold_threshold=0,
+                   max_media=0, css_extra=""):
     """
     Build tree, handle article mode, and return the HTML fragment string.
     Shared by process_file and regenerate_file.
@@ -3140,7 +3366,8 @@ def _render_thread(stammtoot, desc, fm, instance, full_url,
                 media_dir=media_dir,
                 media_base_url=media_base_url,
                 media_max_age_s=media_max_age_s,
-                labels=labels)
+                labels=labels,
+                max_media=max_media)
             art_ids = set(str(t.get("id", "")) for t in chain)
             art_ids.add(str(stammtoot.get("id", "")))
 
@@ -3159,7 +3386,8 @@ def _render_thread(stammtoot, desc, fm, instance, full_url,
         media_max_age_s=media_max_age_s,
         article_nocomment=is_nocomment,
         labels=labels, highlight_above=highlight_above,
-        fold_depth=fold_depth, fold_threshold=fold_threshold)
+        fold_depth=fold_depth, fold_threshold=fold_threshold,
+        max_media=max_media, css_extra=css_extra)
     return fragment, stats
 
 
@@ -3202,7 +3430,8 @@ def process_file(filepath, toot_cache_dir, max_age_s, token=None,
                  prefix=DEFAULT_PREFIX,
                  labels=None,
                  highlight_above=0,
-                 fold_depth=0, fold_threshold=0):
+                 fold_depth=0, fold_threshold=0,
+                 max_media=0, css_extra=""):
     """
     Returns: ('written'|'cached'|'skipped'|'stale'|'frozen'|'error',
               toot_id_or_None)
@@ -3264,7 +3493,8 @@ def process_file(filepath, toot_cache_dir, max_age_s, token=None,
         media_dir=media_dir, media_base_url=media_base_url,
         media_max_age_s=media_max_age_s, labels=labels,
         highlight_above=highlight_above,
-        fold_depth=fold_depth, fold_threshold=fold_threshold)
+        fold_depth=fold_depth, fold_threshold=fold_threshold,
+        max_media=max_media, css_extra=css_extra)
 
     _atomic_write(out_path, fragment)
 
@@ -3290,7 +3520,8 @@ def regenerate_file(filepath, toot_cache_dir,
                     ignore_frozen=False,
                     labels=None,
                     highlight_above=0,
-                    fold_depth=0, fold_threshold=0):
+                    fold_depth=0, fold_threshold=0,
+                    max_media=0, css_extra=""):
     """
     Regenerate the .html.include fragment from cached JSON sidecar data.
     No API calls are made.
@@ -3329,7 +3560,8 @@ def regenerate_file(filepath, toot_cache_dir,
         media_dir=media_dir, media_base_url=media_base_url,
         media_max_age_s=media_max_age_s, labels=labels,
         highlight_above=highlight_above,
-        fold_depth=fold_depth, fold_threshold=fold_threshold)
+        fold_depth=fold_depth, fold_threshold=fold_threshold,
+        max_media=max_media, css_extra=css_extra)
 
     new_hash = _content_hash(fragment)
     if old_hash and new_hash == old_hash:
@@ -3385,6 +3617,97 @@ def find_markdown_files(root_dir, since_weeks=None):
 
     result.sort()
     return result
+
+
+def collect_sidecar_stats(root_dir, toot_cache_dir, prefix=DEFAULT_PREFIX,
+                          stale_after_s=0):
+    """
+    Read all sidecars for active .markdown files and return a list of
+    per-thread stat dicts.  No API calls, no writes.
+
+    Each dict contains:
+      toot_id, source, reply_count, unique_users, latest_date,
+      fetched_at, age_hours, stale, frozen
+    """
+    results = []
+    now = time.time()
+    for dirpath, _dirs, fnames in os.walk(root_dir):
+        for fn in sorted(fnames):
+            if not fn.endswith(".markdown"):
+                continue
+            fpath = os.path.join(dirpath, fn)
+            fm = parse_frontmatter(fpath)
+            if fm is None or not is_enabled(fm):
+                continue
+            raw = fm.get("commenttoot", "").strip()
+            if not raw:
+                continue
+            try:
+                _, tid, _ = resolve_toot_url(raw, prefix)
+            except ValueError:
+                continue
+
+            is_frozen = fm.get("mastodonfreeze", "").lower() in (
+                "true", "yes", "1")
+
+            # Read sidecar metadata (without full api_data parse)
+            sc_path = os.path.join(toot_cache_dir, "{}.json".format(tid))
+            try:
+                with open(sc_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                results.append({
+                    "toot_id": tid,
+                    "source": os.path.relpath(fpath, root_dir),
+                    "reply_count": None,
+                    "unique_users": None,
+                    "latest_date": None,
+                    "fetched_at": None,
+                    "age_hours": None,
+                    "stale": None,
+                    "frozen": is_frozen,
+                    "sidecar": False,
+                })
+                continue
+
+            reply_count = data.get("reply_count", 0)
+            unique_users = data.get("unique_users", 0)
+            latest_date = data.get("latest_toot_date", "")
+            fetched_at = data.get("fetched_at", "")
+
+            # Compute age since fetch
+            age_hours = None
+            if fetched_at:
+                try:
+                    clean_ts = fetched_at.replace("Z", "+00:00")
+                    ft = datetime.fromisoformat(clean_ts).timestamp()
+                    age_hours = round((now - ft) / 3600.0, 1)
+                except (ValueError, TypeError):
+                    pass
+
+            # Compute stale status
+            is_stale = False
+            if stale_after_s > 0 and latest_date:
+                try:
+                    clean_ld = latest_date.replace("Z", "+00:00")
+                    ld = datetime.fromisoformat(clean_ld).timestamp()
+                    is_stale = (now - ld) > stale_after_s
+                except (ValueError, TypeError):
+                    pass
+
+            results.append({
+                "toot_id": tid,
+                "source": os.path.relpath(fpath, root_dir),
+                "reply_count": reply_count,
+                "unique_users": unique_users,
+                "latest_date": latest_date,
+                "fetched_at": fetched_at,
+                "age_hours": age_hours,
+                "stale": is_stale,
+                "frozen": is_frozen,
+                "sidecar": True,
+            })
+    return results
 
 
 def collect_all_toot_ids(root_dir, prefix=DEFAULT_PREFIX):
@@ -3539,6 +3862,16 @@ def main():
              "(0 = always fold if fold-depth > 0). "
              "Default: {}".format(DEFAULT_FOLD_THRESH))
     ap.add_argument(
+        "--max-media", type=int, default=DEFAULT_MAX_MEDIA,
+        help="Max media attachments to embed per toot. "
+             "Excess attachments show a link to the original toot. "
+             "0 = unlimited. Default: {}".format(DEFAULT_MAX_MEDIA))
+    ap.add_argument(
+        "--css-extra", default=None,
+        help="Path to a CSS file whose contents are appended "
+             "after the built-in scoped CSS. Use to override "
+             "colors, spacing, or add custom rules.")
+    ap.add_argument(
         "--sort", choices=["oldest", "newest", "popular"],
         default="oldest",
         help="Sort order for replies: oldest (chronological, default), "
@@ -3594,8 +3927,22 @@ def main():
         help="Validate all JSON sidecars for integrity "
              "(no API calls, no writes, exit 1 on errors)")
     ap.add_argument(
+        "--stats-only", action="store_true",
+        help="Read cached sidecars and print per-thread statistics "
+             "as JSON lines to stdout. No API calls, no writes.")
+    ap.add_argument(
+        "--migrate-sidecars", action="store_true",
+        help="Upgrade all JSON sidecars to the current version, "
+             "adding missing fields. No API calls.")
+    ap.add_argument(
         "--no-lock", action="store_true",
         help="Skip lockfile check (allow parallel instances)")
+    ap.add_argument(
+        "--timeout", type=int, default=DEFAULT_TIMEOUT,
+        help="Global timeout in seconds for the entire run. "
+             "After this time, the current thread finishes and the "
+             "process exits with a summary. 0 = no timeout "
+             "(default: {})".format(DEFAULT_TIMEOUT))
     vgroup = ap.add_mutually_exclusive_group()
     vgroup.add_argument(
         "--verbose", action="store_true",
@@ -3636,6 +3983,18 @@ def main():
         log_warn("WARN: rate-limit raised to minimum of 1 second")
         args.rate_limit = 1.0
 
+    # Read extra CSS file
+    css_extra = ""
+    if args.css_extra:
+        try:
+            with open(args.css_extra, "r", encoding="utf-8") as fh:
+                css_extra = fh.read().strip()
+            log_debug("CSS EXTRA   {} ({} bytes)".format(
+                args.css_extra, len(css_extra)))
+        except OSError as e:
+            log_error("ERROR: Cannot read --css-extra: {}".format(e))
+            sys.exit(1)
+
     root_dir = os.path.abspath(args.directory)
     if not os.path.isdir(root_dir):
         log_error("ERROR: Not a directory: {}".format(root_dir))
@@ -3668,6 +4027,14 @@ def main():
     # --- Install signal handlers for graceful shutdown ---
     signal.signal(signal.SIGTERM, _shutdown_handler)
     signal.signal(signal.SIGINT, _shutdown_handler)
+
+    # --- Global timeout ---
+    _timeout_timer = None
+    if args.timeout > 0:
+        _timeout_timer = threading.Timer(args.timeout, _timeout_expired)
+        _timeout_timer.daemon = True
+        _timeout_timer.start()
+        log_debug("TIMEOUT     {}s".format(args.timeout))
 
     # --- Cleanup mode ---
     if args.cleanup_all:
@@ -3741,6 +4108,42 @@ def main():
             sys.exit(1)
         return
 
+    # --- Stats-only mode ---
+    if args.stats_only:
+        stale_after_s = parse_stale_after(args.stale_after)
+        stats_list = collect_sidecar_stats(
+            root_dir, toot_cache_dir,
+            prefix=args.prefix, stale_after_s=stale_after_s)
+
+        # Output as JSON array to stdout (bypasses log system)
+        sys.stdout.write(json.dumps(stats_list, indent=2,
+                                    ensure_ascii=False))
+        sys.stdout.write("\n")
+        return
+
+    # --- Migrate sidecars mode ---
+    if args.migrate_sidecars:
+        if _config_msg:
+            log_info(_config_msg)
+        log_info("MIGRATE  Upgrading sidecars in {}".format(toot_cache_dir))
+        log_info("         Target version: {}".format(SIDECAR_VERSION))
+
+        result = migrate_sidecars(toot_cache_dir)
+
+        log_info("")
+        log_info("=" * 50)
+        log_info("  Checked:  {} sidecar(s)".format(result["checked"]))
+        log_info("  Migrated: {}".format(result["migrated"]))
+        log_info("  Skipped:  {} (already current or future)".format(
+            result["skipped"]))
+        if result["error"]:
+            log_info("  Errors:   {}".format(result["error"]))
+        log_info("=" * 50)
+
+        if result["error"]:
+            sys.exit(1)
+        return
+
     # --- Regenerate mode ---
     if args.regenerate or args.regenerate_all:
         ignore_frozen   = args.regenerate_all
@@ -3806,13 +4209,15 @@ def main():
                 labels=labels,
                 highlight_above=args.highlight_above,
                 fold_depth=args.fold_depth,
-                fold_threshold=args.fold_threshold)
+                fold_threshold=args.fold_threshold,
+                max_media=args.max_media,
+                css_extra=css_extra)
             stats[result] = stats.get(result, 0) + 1
 
         log_info("")
         log_info("=" * 50)
         if _shutdown_requested:
-            log_info("  (Interrupted by signal – partial run)")
+            log_info("  (Interrupted – partial run)")
         log_info("  Regenerated: {}".format(stats["written"]))
         if stats["unchanged"]:
             log_info("  Unchanged:   {}".format(stats["unchanged"]))
@@ -3929,7 +4334,9 @@ def main():
             labels=labels,
             highlight_above=args.highlight_above,
             fold_depth=args.fold_depth,
-            fold_threshold=args.fold_threshold)
+            fold_threshold=args.fold_threshold,
+            max_media=args.max_media,
+            css_extra=css_extra)
         stats[result] = stats.get(result, 0) + 1
         if tid:
             active_ids.add(tid)
@@ -3940,7 +4347,7 @@ def main():
     log_info("")
     log_info("=" * 50)
     if _shutdown_requested:
-        log_info("  (Interrupted by signal – partial run)")
+        log_info("  (Interrupted – partial run)")
     if args.dry_run:
         log_info("  (Dry run - nothing was written)")
     else:
