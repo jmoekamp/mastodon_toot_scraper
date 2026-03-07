@@ -2,11 +2,6 @@
 
 A static-site generator plugin that fetches Mastodon threads and renders them as self-contained HTML fragments for embedding in blog posts. It scans `.markdown` files for frontmatter fields, fetches the corresponding Mastodon thread via the public API, and writes `.html.include` files ready for server-side inclusion.
 
-## AI
-This tool and documentation is 100% AI. So i don't have any copyright on it. Do want you want with the code. I would assume the strictest open source license in case the AI took code from somewhere else. 
-
-It works for me. Use it on your own risk. It didn't ruined my system when i used it.
-
 ## Table of Contents
 
 - [Quick Start](#quick-start)
@@ -113,6 +108,8 @@ python3 toot.py [options] directory
 | `--highlight-above N` | `10` | Highlight replies with at least N favourites (golden accent border). Set to 0 to disable |
 | `--fold-depth N` | `3` | Fold subtrees at this nesting depth into a collapsible `<details>` element. Set to 0 to disable |
 | `--fold-threshold N` | `50` | Only fold when total comment count exceeds this number. Set to 0 to always fold (when fold-depth > 0) |
+| `--max-media N` | `3` | Max media attachments to embed per toot. Excess shows a "N more" link. Set to 0 for unlimited |
+| `--css-extra FILE` | off | Path to a CSS file appended after the built-in scoped CSS. Use to override colors, spacing, or add custom rules without modifying the script |
 
 ### Caching
 
@@ -168,6 +165,9 @@ python3 toot.py [options] directory
 | `--dry-run` | off | Show what would be done without making API calls or writing files |
 | `--no-lock` | off | Skip lockfile check, allowing parallel instances |
 | `--validate` | off | Validate all JSON sidecars for integrity (no API calls, no writes). Exit 1 on errors, exit 0 on warnings only |
+| `--stats-only` | off | Read cached sidecars and print per-thread statistics as a JSON array to stdout. No API calls, no writes. Use with `--quiet` for clean JSON output |
+| `--migrate-sidecars` | off | Upgrade all JSON sidecars to the current version, adding missing fields. No API calls. Idempotent — safe to run multiple times |
+| `--timeout SECONDS` | `3540` (59 min) | Global timeout for the entire run. After this many seconds, the current thread finishes and the process exits with a summary. Set to 0 to disable |
 
 ### Logging
 
@@ -223,6 +223,8 @@ max_toots = 0
 highlight_above = 10
 fold_depth = 3
 fold_threshold = 50
+max_media = 3
+css_extra = /path/to/custom.css
 sort = oldest
 since = 4
 hide_bots = false
@@ -333,6 +335,61 @@ Cross-checks against `.markdown` sources report orphaned sidecars (no matching s
 
 Structural problems (corrupt JSON, missing required keys, future version, bad api_data) are errors. Outdated versions, missing metadata, and orphaned/missing sidecars are warnings. Exit code is 1 if any errors are found, 0 otherwise (warnings alone do not cause a non-zero exit).
 
+### Statistics
+
+`--stats-only` reads cached sidecars and outputs per-thread statistics as a JSON array to stdout. No API calls are made and nothing is written. Use `--quiet` for clean JSON output without log messages.
+
+```bash
+# All threads as JSON
+python3 toot.py /path/to/content/ --stats-only --quiet --all
+
+# Top 5 threads by reply count
+python3 toot.py /path/to/content/ --stats-only --quiet --all | jq 'sort_by(-.reply_count) | .[0:5]'
+
+# Stale threads only
+python3 toot.py /path/to/content/ --stats-only --quiet --all | jq '[.[] | select(.stale==true)]'
+
+# Threads missing sidecars
+python3 toot.py /path/to/content/ --stats-only --quiet --all | jq '[.[] | select(.sidecar==false)]'
+```
+
+Each entry contains: `toot_id`, `source` (relative path to .markdown file), `reply_count`, `unique_users`, `latest_date`, `fetched_at`, `age_hours` (hours since last fetch), `stale` (boolean, based on `--stale-after`), `frozen` (boolean), and `sidecar` (boolean, false if no cached data exists).
+
+### Custom CSS
+
+`--css-extra /path/to/custom.css` appends additional CSS rules after the built-in scoped styles. The file contents are injected as a second `<style>` block in every generated HTML fragment. This is the recommended way to customize the appearance without editing the script.
+
+Example `custom.css` — override accent color and card background:
+
+```css
+/* Use site brand color for links and accents */
+.mt-wrap { --mt-accent: #e63946; }
+
+/* Wider cards on desktop */
+@media (min-width: 768px) {
+  .mt__card { max-width: 720px; }
+}
+
+/* Hide engagement stats completely */
+.mt__stats { display: none; }
+```
+
+All built-in CSS variables (`--mt-bg`, `--mt-card`, `--mt-accent`, etc.) can be overridden this way. Changing `--css-extra` triggers a content hash change, so `--regenerate` will rewrite affected fragments.
+
+### Sidecar Migration
+
+`--migrate-sidecars` upgrades all JSON sidecars to the current format without making API calls. Use this after upgrading toot.py to a version with a new sidecar format, or after `--validate` reports outdated or incomplete sidecars.
+
+```bash
+# Check what needs migration
+python3 toot.py /path/to/content/ --validate
+
+# Migrate all sidecars
+python3 toot.py /path/to/content/ --migrate-sidecars
+```
+
+The migration adds missing fields with sensible defaults, recomputes `reply_count` from stored API data, fills in `toot_id` from the filename if empty, and bumps `sidecar_version` to the current version. Sidecars that are already current are skipped. Future-version sidecars (from a newer toot.py) are left untouched. The operation is idempotent — running it multiple times is safe. Corrupt sidecars are reported as errors but do not prevent other sidecars from being migrated.
+
 ### Cleanup
 
 Over time, cache files accumulate for deleted or changed posts. Three cleanup modes are available:
@@ -377,7 +434,7 @@ By default, `--regenerate` skips threads marked with `mastodonfreeze: true`. Use
 python3 toot.py --regenerate-all --theme light /path/to/content/
 ```
 
-Settings that take effect on regeneration include: `--theme`, `--blocklist`, `--whitelist`, `--max-depth`, `--max-toots`, `--highlight-above`, `--fold-depth`, `--fold-threshold`, `--sort`, `--hide-bots`, `--custom-emojis`, `--article`, avatar/media URL mappings.
+Settings that take effect on regeneration include: `--theme`, `--css-extra`, `--blocklist`, `--whitelist`, `--max-depth`, `--max-toots`, `--max-media`, `--highlight-above`, `--fold-depth`, `--fold-threshold`, `--sort`, `--hide-bots`, `--custom-emojis`, `--article`, avatar/media URL mappings.
 
 Regeneration is incremental: a SHA-256 hash of the generated HTML (excluding the "Generated …" timestamp) is stored in the sidecar. On the next `--regenerate`, the new output is compared against the stored hash — if identical, the file is not rewritten. This preserves file modification times and avoids unnecessary I/O, which is relevant for build systems that trigger on mtime changes. If settings change (e.g. `--theme`), the hash will differ and the file is rewritten.
 
@@ -462,6 +519,8 @@ boost_duplicate = ebenfalls geteilt &ndash; Original oben angezeigt
 # Media
 media_link = {n} Medienanhänge &ndash; im Original ansehen
 media_link_1 = {n} Medienanhang &ndash; im Original ansehen
+media_more = {n} weitere Medien &ndash; im Original ansehen
+media_more_1 = {n} weiteres &ndash; im Original ansehen
 
 # Poll
 poll_aria = Umfrage
@@ -649,6 +708,8 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 | **Alt-text badge** | Images with alt text show an "ALT" badge in the bottom-left corner. Hover or click to read the full description |
 | **Media gating** | Only the OP's media is embedded inline. Non-OP media shows a link to the original toot ("1 media attachment – view on original toot ↗") |
 | **Responsive images** | OP images use `srcset` with the preview (~400px) and original resolution, both cached locally. The browser picks the smallest sufficient source based on viewport width, saving bandwidth on mobile |
+| **Media limit** | `--max-media` (default 3) caps embedded media per toot. Excess attachments show a "N more – view on original toot" link. Set to 0 for unlimited |
+| **Emoji-only toots** | Replies consisting only of 1–10 emoji characters (e.g. 👍, ❤️🔥) are rendered in larger font (2rem), matching Mastodon's native display |
 | **Link preview cards** | When an OP toot contains a link preview (OpenGraph card), it is rendered as a compact box with thumbnail, title, description, and provider. Thumbnails are cached locally via the media cache. Cards are suppressed when the toot has media attachments (matching Mastodon's behavior) |
 | **Quoted toots** | Mastodon 4.3+ quote posts are rendered as an embedded box showing the quoted author's avatar, handle, timestamp, and body text (clamped to 4 lines). Clicking the box opens the original quoted toot. Works for all toots (OP and non-OP), coexists with media and cards |
 | **Polls** | Rendered as bar charts with vote counts and percentages |
@@ -668,11 +729,14 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 | **Atomic writes** | All file writes (`.html.include` and `.json`) use temp-file-then-rename, so a crash never leaves corrupt files. Corrupt sidecars are skipped gracefully |
 | **Cross-cache collision detection** | At startup, warns if cache directories overlap (e.g. `--avatar-dir` == `--media-dir`). At runtime, warns before writing a file that already exists in a different cache. Also detects the (astronomically unlikely) case of two different URLs producing the same SHA-256 hash within a single cache |
 | **Exit codes** | Exit 0 on success, exit 1 on errors. Enables `set -e` in build scripts and CI/CD error detection |
-| **Graceful SIGTERM/SIGINT** | On `SIGTERM` or `SIGINT` (Ctrl+C), the current thread finishes processing (atomic write completes), then the loop stops and prints a summary with "(Interrupted by signal – partial run)". No data is left in an inconsistent state |
+| **Graceful SIGTERM/SIGINT/timeout** | On `SIGTERM`, `SIGINT` (Ctrl+C), or `--timeout` expiry, the current thread finishes processing (atomic write completes), then the loop stops and prints a summary with "(Interrupted – partial run)". All sleeps (rate limiting, retries) are interruptible in 1-second steps, so the process responds promptly even during long waits |
 | **Auto theme** | `--theme auto` emits both dark and light schemes via `@media (prefers-color-scheme)`. No JavaScript needed |
 | **Print stylesheet** | `@media print` rules override colors to white background, force-open all folds and sensitive content, shrink avatars, hide decorative thread lines, print link URLs inline, and add `break-inside:avoid` on toot cards. Works with all themes |
+| **Custom CSS** | `--css-extra file.css` appends custom CSS rules after the built-in scoped styles. Override colors, adjust spacing, or add new rules without modifying the script. Affects content hash for regeneration skip |
 | **Lockfile** | Exclusive `flock()`-based lockfile prevents concurrent instances from corrupting shared cache. Disable with `--no-lock` |
 | **Sidecar validation** | `--validate` checks all JSON sidecars for structural integrity, version compatibility, and cross-references with `.markdown` sources. No API calls, no writes |
+| **Statistics export** | `--stats-only` outputs per-thread statistics (reply count, unique users, latest activity, stale/frozen status, cache age) as a JSON array to stdout. No API calls, no writes. Pipe through `jq` for filtering and reporting |
+| **Sidecar migration** | `--migrate-sidecars` upgrades all JSON sidecars to the current version, adding missing fields (e.g. `content_hash`) and recomputing `reply_count` from stored API data. No API calls. Idempotent — safe to run repeatedly |
 
 ### Operational Features
 
@@ -758,7 +822,12 @@ python3 toot.py \
 0 * * * * python3 /opt/toot.py --config /etc/toot.ini --quiet /srv/blog/content/
 ```
 
-When running under systemd timers or in containers, toot.py handles `SIGTERM` gracefully: the current thread finishes writing (atomic write completes), the loop stops, and a summary is printed. `SIGINT` (Ctrl+C) is handled identically.
+When running under systemd timers or in containers, toot.py handles `SIGTERM` gracefully: the current thread finishes writing (atomic write completes), the loop stops, and a summary is printed. `SIGINT` (Ctrl+C) is handled identically. Use `--timeout 3600` to ensure the process exits within a fixed time budget, for example in cron jobs that must not overlap:
+
+```bash
+# Hourly: refresh comments, hard limit 50 minutes
+0 * * * * python3 /opt/toot.py --config /etc/toot.ini --quiet --timeout 3000 /srv/blog/content/
+```
 
 ---
 
