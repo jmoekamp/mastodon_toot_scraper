@@ -553,7 +553,8 @@ comments_header = Kommentare
 article_label = Artikel
 reply_on = Antworten auf
 view_on = Ansehen auf
-no_comments = Noch keine Kommentare. Sei der Erste!
+no_comments = Noch keine Kommentare.
+be_first = Sei der Erste!
 comments_separator = Kommentare
 
 # Thread stats
@@ -705,6 +706,7 @@ All CSS is scoped under the `.mt-wrap` namespace and uses CSS custom properties,
 | **Content warnings** | Spoiler text is shown as a collapsible "Show content" block |
 | **Sensitive media** | Images/videos marked sensitive are wrapped in a click-to-reveal element |
 | **Empty body suppression** | Toots with no text content (e.g. media-only posts, empty boost wrappers) omit the body element entirely, avoiding blank gaps in the layout |
+| **Empty thread engagement** | When no comments exist yet, the root toot's engagement stats (favs, boosts, replies) are shown above a "Be the first to reply!" call-to-action link. Stats bar is omitted if all counts are zero |
 | **Alt-text badge** | Images with alt text show an "ALT" badge in the bottom-left corner. Hover or click to read the full description |
 | **Media gating** | Only the OP's media is embedded inline. Non-OP media shows a link to the original toot ("1 media attachment – view on original toot ↗") |
 | **Responsive images** | OP images use `srcset` with the preview (~400px) and original resolution, both cached locally. The browser picks the smallest sufficient source based on viewport width, saving bandwidth on mobile |
@@ -964,7 +966,9 @@ This means two different URLs produced the same SHA-256 filename within a single
 
 ### Empty thread / "0 comments"
 
-The toot may be on a private or restricted account. Use `--token` with an access token that has read permissions for that account.
+When no one has replied to the root toot, the fragment shows the root toot's engagement stats (favourites, boosts, replies) above a "No comments yet" message with a "Be the first to reply!" link to the toot. If the toot has zero engagement across all metrics, the stats bar is omitted but the encouragement message is still shown.
+
+If you expect comments but see this empty state, the toot may be on a private or restricted account. Use `--token` with an access token that has read permissions for that account.
 
 ### Corrupt or truncated JSON sidecar
 
