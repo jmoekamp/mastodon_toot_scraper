@@ -140,7 +140,8 @@ DEFAULT_LABELS = {
     "article_label":        "Article",
     "reply_on":             "Reply on",
     "view_on":              "View on",
-    "no_comments":          "No comments yet. Be the first!",
+    "no_comments":          "No comments yet.",
+    "be_first":             "Be the first to reply!",
     "comments_separator":   "Comments",
 
     # Thread stats
@@ -2265,6 +2266,9 @@ SCOPED_CSS = """<style>
 .{ns}__footer a{{color:var(--mt-accent)}}
 .{ns}__footer a:hover{{opacity:.8}}
 .{ns}__nocomments{{text-align:center;padding:1.5rem .5rem;color:var(--mt-dim);font-size:.9rem}}
+.{ns}__empty-stats{{display:flex;justify-content:center;gap:1.2rem;padding:.8rem 0;margin:0 auto;border-bottom:1px solid var(--mt-border)}}
+.{ns}__empty-stats .{ns}__st{{font-size:.85rem}}
+.{ns}__be-first{{display:inline-block;margin-top:.5rem;color:var(--mt-accent);font-weight:600;font-size:.88rem}}
 @keyframes mt-fadeUp{{from{{opacity:0;transform:translateY(10px)}}to{{opacity:1;transform:translateY(0)}}}}
 .{ns}__toot{{animation:mt-fadeUp .35s ease both}}
 .{ns}__fold{{margin-top:.2rem}}
@@ -2569,13 +2573,48 @@ def generate_fragment(root_node, instance, total, toot_url,
              footer_label=footer_label)
 
 
-def generate_empty(toot_url, instance, theme="dark", labels=None):
+def generate_empty(toot_url, instance, theme="dark", labels=None,
+                   stammtoot=None, css_extra=""):
     if labels is None:
         labels = DEFAULT_LABELS
     css      = scoped_css(theme)
+    if css_extra:
+        css += "\n<style>\n{}\n</style>".format(css_extra)
     esc_inst = H.escape(instance)
     esc_url  = H.escape(toot_url)
     now_utc  = datetime.now(timezone.utc).strftime("%b %d, %Y at %H:%M UTC")
+
+    # Root toot engagement stats
+    stats_html = ""
+    if stammtoot and isinstance(stammtoot, dict):
+        n_reply = stammtoot.get("replies_count", 0) or 0
+        n_boost = stammtoot.get("reblogs_count", 0) or 0
+        n_fav   = stammtoot.get("favourites_count", 0) or 0
+        if n_reply or n_boost or n_fav:
+            stats_html = (
+                '  <div class="{ns}__empty-stats" role="group"'
+                ' aria-label="{engagement_aria}">\n'
+                '    <span class="{ns}__st {ns}__st--reply"'
+                ' aria-label="{replies_aria}">'
+                '{svg_reply}{n_reply}</span>\n'
+                '    <span class="{ns}__st {ns}__st--boost"'
+                ' aria-label="{boosts_aria}">'
+                '{svg_boost}{n_boost}</span>\n'
+                '    <span class="{ns}__st {ns}__st--fav"'
+                ' aria-label="{favs_aria}">'
+                '{svg_star}{n_fav}</span>\n'
+                '  </div>\n'
+            ).format(ns=NS,
+                     svg_reply=SVG_REPLY, svg_boost=SVG_BOOST,
+                     svg_star=SVG_STAR,
+                     n_reply=n_reply, n_boost=n_boost, n_fav=n_fav,
+                     engagement_aria=labels["engagement_aria"],
+                     replies_aria=_pl(labels, "replies_aria",
+                                      n_reply).format(n=n_reply),
+                     boosts_aria=_pl(labels, "boosts_aria",
+                                     n_boost).format(n=n_boost),
+                     favs_aria=_pl(labels, "favs_aria",
+                                   n_fav).format(n=n_fav))
 
     return (
         "{css}\n"
@@ -2588,8 +2627,12 @@ def generate_empty(toot_url, instance, theme="dark", labels=None):
         "    <span><strong>{mastodon}</strong>"
         " &middot; {comments_header}</span>\n"
         "  </div>\n"
+        "{stats}"
         '  <div class="{ns}__nocomments">\n'
-        "    {no_comments}\n"
+        "    {no_comments}<br>\n"
+        '    <a href="{url}" target="_blank" rel="noopener"'
+        ' class="{ns}__be-first">'
+        "{be_first} &#8599;</a>\n"
         "  </div>\n"
         '  <div class="{ns}__footer">\n'
         '    <a href="{url}" target="_blank" rel="noopener">'
@@ -2602,8 +2645,10 @@ def generate_empty(toot_url, instance, theme="dark", labels=None):
              comments_aria=labels["comments_aria"],
              comments_header=labels["comments_header"],
              no_comments=labels["no_comments"],
+             be_first=labels["be_first"],
              reply_on=labels["reply_on"],
-             inst=esc_inst, url=esc_url)
+             inst=esc_inst, url=esc_url,
+             stats=stats_html)
 
 
 # =========================================================================
@@ -3338,7 +3383,8 @@ def _render_thread(stammtoot, desc, fm, instance, full_url,
     stats = collect_stats(stammtoot, desc, blocklist, whitelist)
 
     if not desc:
-        return generate_empty(full_url, instance, theme, labels=labels), stats
+        return generate_empty(full_url, instance, theme, labels=labels,
+                              stammtoot=stammtoot, css_extra=css_extra), stats
 
     root  = build_tree(stammtoot, desc)
     total = 1 + len(desc)
